@@ -1,0 +1,58 @@
+services:
+
+  # ====================================================================================
+  # EDGE IMPULSE STACK
+  # ====================================================================================
+
+  # ------------------------------------------------------------------------------------
+  # Edge Impulse Inference Runner
+  # ------------------------------------------------------------------------------------
+  ei-runner:
+    build: ./runner
+    container_name: p4n4-ei-runner
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # Health / status API
+    environment:
+      # Edge Impulse model file (place .eim in edge-impulse/models/)
+      EI_MODEL_PATH: /models/${EI_MODEL_FILE:-model.eim}
+      EI_API_KEY: ${EI_API_KEY:-}
+      # MQTT broker (shared with p4n4-iot — must match values in p4n4-iot .env)
+      MQTT_HOST: ${MQTT_HOST:-p4n4-mqtt}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USER: ${MQTT_USER:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_TOPIC_INPUT: ${MQTT_TOPIC_INPUT:-sensors/raw}
+      MQTT_TOPIC_RESULTS: ${MQTT_TOPIC_RESULTS:-inference/results}
+      # InfluxDB (shared with p4n4-iot — must match values in p4n4-iot .env)
+      INFLUXDB_URL: http://p4n4-influxdb:8086
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-p4n4-stack-token}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-ming}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET_AI_EVENTS:-ai_events}
+      TZ: ${TZ:-UTC}
+    volumes:
+      # Mount model directory read-only — place .eim files here at deploy time
+      - ./edge-impulse/models:/models:ro
+      - ei-runner-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - p4n4-net
+
+# ====================================================================================
+# NETWORKS
+# ====================================================================================
+networks:
+  p4n4-net:
+    external: true
+    name: p4n4-net
+
+# ====================================================================================
+# VOLUMES
+# ====================================================================================
+volumes:
+  ei-runner-data:

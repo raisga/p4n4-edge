@@ -1,0 +1,49 @@
+# ==============================================================================
+# Edge Impulse Stack .gitignore
+# ==============================================================================
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Local compose overrides
+docker-compose.override.yml
+
+# Edge Impulse model binaries (provided at deploy time — NEVER commit)
+edge-impulse/models/*.eim
+edge-impulse/models/*.eim.bak
+edge-impulse/models/*.zip
+
+# Docker volumes (if mounted locally)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

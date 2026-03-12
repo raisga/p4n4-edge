@@ -1,0 +1,24 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Lint YAML configs
+        run: |
+          pip install yamllint
+          yamllint -d "{extends: relaxed, rules: {line-length: {max: 120}}}" \
+            docker-compose.yml .env.example
+
+      - name: Check .env.example completeness
+        run: python3 scripts/check_env_example.py
+
+      - name: Build runner image
+        run: docker compose build ei-runner

@@ -1,0 +1,58 @@
+# ==============================================================================
+# docker-compose.override.yml — Local Overrides Example
+# ==============================================================================
+# Copy to docker-compose.override.yml and uncomment the sections you need.
+# Docker Compose automatically merges this file with docker-compose.yml.
+# DO NOT commit docker-compose.override.yml (it's in .gitignore).
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+# ==============================================================================
+
+services:
+
+  # ----------------------------------------------------------------------------
+  # ei-runner: mount a specific model file (override EI_MODEL_FILE at runtime)
+  # ----------------------------------------------------------------------------
+  # ei-runner:
+  #   environment:
+  #     EI_MODEL_FILE: my-custom-model-v2.eim
+
+  # ----------------------------------------------------------------------------
+  # ei-runner: NVIDIA GPU acceleration (for GPU-enabled .eim models)
+  # ----------------------------------------------------------------------------
+  # ei-runner:
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+
+  # ----------------------------------------------------------------------------
+  # ei-runner: run on a standalone network (without p4n4-iot / p4n4-net)
+  # ----------------------------------------------------------------------------
+  # ei-runner:
+  #   environment:
+  #     MQTT_HOST: "your-broker-host"
+  #     MQTT_PORT: "1883"
+  #     INFLUXDB_URL: "http://your-influxdb-host:8086"
+  #   networks:
+  #     - standalone-net
+  #
+  # networks:
+  #   standalone-net:
+  #     driver: bridge
+  #   p4n4-net:          # override the external network to make it optional
+  #     external: false
+  #     name: p4n4-net
+
+  # ----------------------------------------------------------------------------
+  # ei-runner: expose debug port for local development
+  # ----------------------------------------------------------------------------
+  # ei-runner:
+  #   ports:
+  #     - "8080:8080"
+  #     - "5678:5678"   # remote debugger (if enabled)
+  #   environment:
+  #     LOG_LEVEL: DEBUG
