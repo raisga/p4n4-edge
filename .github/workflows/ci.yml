@@ -22,3 +22,21 @@ jobs:
 
       - name: Build runner image
         run: docker compose build ei-runner
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: pip install paho-mqtt pytest
+
+      - name: Run tests
+        run: pytest tests/ -v
