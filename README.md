@@ -323,7 +323,14 @@ docker compose up -d
 **Option 3 — Use the CLI:**
 
 ```bash
-p4n4 up --all   # starts all stacks in the correct order
+```
+
+or
+
+```bash
+p4n4 up          # start IoT stack
+p4n4 up --ai     # start AI stack
+p4n4 up --edge   # start Edge stack
 ```
 
 ---
