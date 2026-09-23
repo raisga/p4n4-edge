@@ -10,10 +10,12 @@
 # Local compose overrides
 docker-compose.override.yml
 
-# Edge Impulse model binaries (provided at deploy time — NEVER commit)
+# Model binaries (provided at deploy time — NEVER commit)
 edge-impulse/models/*.eim
 edge-impulse/models/*.eim.bak
 edge-impulse/models/*.zip
+onnx/models/*.onnx
+onnx/models/*.onnx.bak
 
 # Docker volumes (if mounted locally)
 data/

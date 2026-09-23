@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-p4n4-edge — Edge Impulse Inference Runner
+p4n4-edge — Edge AI Inference Runner
 
-Loads an Edge Impulse .eim model, subscribes to raw sensor data on MQTT,
-runs inference for each message, and publishes results back to MQTT and
-InfluxDB (ai_events bucket).
+Loads an Edge Impulse .eim model or an ONNX model, subscribes to raw sensor
+data on MQTT, runs inference for each message, and publishes results back to
+MQTT and InfluxDB (ai_events bucket).
 
-When no .eim model is found, the runner operates in mock mode and generates
+When no model is found, the runner operates in mock mode and generates
 simulated inference results so the full pipeline can be tested end-to-end.
 
 Environment variables (see .env.example):
+  MODEL_BACKEND       Backend selection: auto | eim | onnx | mock (default: auto)
   EI_MODEL_PATH       Path to the .eim model file (default: /models/model.eim)
   EI_API_KEY          Edge Impulse API key (optional, for cloud features)
+  ONNX_MODEL_PATH     Path to the .onnx model file (default: /onnx-models/model.onnx)
+  ONNX_LABELS         Comma-separated class labels for ONNX output (optional)
   MQTT_HOST           MQTT broker hostname (default: p4n4-mqtt)
   MQTT_PORT           MQTT broker port (default: 1883)
   MQTT_USER           MQTT username (optional)
@@ -57,12 +60,23 @@ try:
 except ImportError:
     HAS_EI_SDK = False
 
+try:
+    import numpy as np
+    import onnxruntime as ort
+
+    HAS_ONNX = True
+except ImportError:
+    HAS_ONNX = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+MODEL_BACKEND = os.environ.get("MODEL_BACKEND", "auto").lower()
 MODEL_PATH = os.environ.get("EI_MODEL_PATH", "/models/model.eim")
+ONNX_MODEL_PATH = os.environ.get("ONNX_MODEL_PATH", "/onnx-models/model.onnx")
+ONNX_LABELS = [s.strip() for s in os.environ.get("ONNX_LABELS", "").split(",") if s.strip()]
 MQTT_HOST = os.environ.get("MQTT_HOST", "p4n4-mqtt")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
@@ -89,7 +103,7 @@ log = logging.getLogger("ei-runner")
 # ---------------------------------------------------------------------------
 
 _state: dict[str, Any] = {
-    "mode": "starting",      # "mock" | "model" | "starting"
+    "mode": "starting",      # "mock" | "model" | "onnx" | "starting"
     "model_file": MODEL_PATH,
     "inference_count": 0,
     "last_inference_at": None,
@@ -98,6 +112,8 @@ _state: dict[str, Any] = {
     "started_at": datetime.now(timezone.utc).isoformat(),
 }
 _runner: ImpulseRunner | None = None
+_onnx_session = None
+_onnx_input_name: str | None = None
 _influx_write_api = None
 _lock = threading.Lock()
 
@@ -195,15 +211,15 @@ def _load_model() -> bool:
     model_file = Path(MODEL_PATH)
     if not model_file.exists():
         log.warning(
-            "Model not found at %s — running in MOCK mode. "
-            "Place a .eim file in edge-impulse/models/ and set EI_MODEL_FILE.",
+            "Edge Impulse model not found at %s — place a .eim file in "
+            "edge-impulse/models/ and set EI_MODEL_FILE.",
             MODEL_PATH,
         )
         return False
 
     if not HAS_EI_SDK:
         log.warning(
-            "edge_impulse_linux SDK not available — running in MOCK mode. "
+            "edge_impulse_linux SDK not available — cannot load .eim model. "
             "This is unexpected inside the container; check the image build."
         )
         return False
@@ -226,9 +242,106 @@ def _load_model() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# ONNX model inference
+# ---------------------------------------------------------------------------
+
+def _load_onnx_model() -> bool:
+    """Try to load the .onnx model. Returns True on success."""
+    global _onnx_session, _onnx_input_name  # noqa: PLW0603
+
+    model_file = Path(ONNX_MODEL_PATH)
+    if not model_file.exists():
+        log.warning(
+            "ONNX model not found at %s — place a .onnx file in onnx/models/ "
+            "and set ONNX_MODEL_FILE.",
+            ONNX_MODEL_PATH,
+        )
+        return False
+
+    if not HAS_ONNX:
+        log.warning(
+            "onnxruntime not available — cannot load ONNX model. "
+            "This is unexpected inside the container; check the image build."
+        )
+        return False
+
+    try:
+        log.info("Loading ONNX model: %s", ONNX_MODEL_PATH)
+        session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+        inp = session.get_inputs()[0]
+        log.info("ONNX model loaded: input '%s' shape=%s", inp.name, inp.shape)
+        _onnx_session = session
+        _onnx_input_name = inp.name
+        return True
+    except Exception as exc:
+        log.error("Failed to load ONNX model: %s", exc)
+        _onnx_session = None
+        _onnx_input_name = None
+        return False
+
+
+def _flatten_scores(output: Any) -> list[float]:
+    """Flatten an ONNX output (ndarray or nested lists) to a flat float list."""
+    if hasattr(output, "flatten"):  # numpy ndarray
+        return [float(v) for v in output.flatten()]
+    if isinstance(output, (list, tuple)):
+        flat: list[float] = []
+        for item in output:
+            flat.extend(_flatten_scores(item))
+        return flat
+    return [float(output)]
+
+
+def _postprocess_onnx_output(output: Any) -> tuple[str, float]:
+    """Turn the first ONNX output into a (label, confidence) pair.
+
+    Handles the two common classifier shapes: a probability map (e.g.
+    sklearn-onnx ZipMap output: [{label: prob, ...}]) and a raw score
+    array (softmax applied when scores are not already probabilities).
+    """
+    # ZipMap-style output: list of {label: prob} dicts, one per batch row
+    if isinstance(output, (list, tuple)) and output and isinstance(output[0], dict):
+        probs = {str(k): float(v) for k, v in output[0].items()}
+    else:
+        scores = _flatten_scores(output)
+        if not scores:
+            return "unknown", 0.0
+        if any(s < 0.0 for s in scores) or not math.isclose(sum(scores), 1.0, abs_tol=1e-3):
+            m = max(scores)
+            exps = [math.exp(s - m) for s in scores]
+            total = sum(exps)
+            scores = [e / total for e in exps]
+        probs = {
+            ONNX_LABELS[i] if i < len(ONNX_LABELS) else f"class_{i}": s
+            for i, s in enumerate(scores)
+        }
+
+    label, confidence = max(probs.items(), key=lambda kv: kv[1], default=("unknown", 0.0))
+    return label, confidence
+
+
 def _run_inference(values: list[float]) -> dict:
     """Run inference on the given feature vector. Returns a result dict."""
     t0 = time.monotonic()
+
+    if _onnx_session is not None:
+        try:
+            x = np.asarray(values, dtype=np.float32).reshape(1, -1)
+            outputs = _onnx_session.run(None, {_onnx_input_name: x})
+            latency_ms = (time.monotonic() - t0) * 1000
+
+            label, confidence = _postprocess_onnx_output(outputs[0])
+
+            return {
+                "label": label,
+                "confidence": round(confidence, 4),
+                "anomaly_score": 0.0,
+                "latency_ms": round(latency_ms, 2),
+                "mode": "onnx",
+            }
+        except Exception as exc:
+            log.warning("ONNX inference error: %s", exc)
 
     if _runner is not None:
         try:
@@ -342,18 +455,33 @@ def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> No
 # Main
 # ---------------------------------------------------------------------------
 
+def _load_backend() -> str:
+    """Load the configured model backend. Returns the resulting mode.
+
+    MODEL_BACKEND=auto tries Edge Impulse first, then ONNX; "eim" and
+    "onnx" force a single backend; anything else (e.g. "mock") skips
+    model loading entirely. Falls back to mock mode when loading fails.
+    """
+    if MODEL_BACKEND in ("auto", "eim") and _load_model():
+        return "model"
+    if MODEL_BACKEND in ("auto", "onnx") and _load_onnx_model():
+        return "onnx"
+    return "mock"
+
+
 def main() -> None:
-    log.info("p4n4-edge — Edge Impulse Inference Runner starting")
+    log.info("p4n4-edge — Edge AI Inference Runner starting (backend=%s)", MODEL_BACKEND)
 
     # Start health server in background
     threading.Thread(target=_start_health_server, daemon=True).start()
 
     # Load model
-    model_loaded = _load_model()
+    mode = _load_backend()
     with _lock:
-        _state["mode"] = "model" if model_loaded else "mock"
+        _state["mode"] = mode
+        _state["model_file"] = ONNX_MODEL_PATH if mode == "onnx" else MODEL_PATH
 
-    if not model_loaded:
+    if mode == "mock":
         log.info("Running in MOCK mode — simulated inference results will be published")
 
     # Connect to InfluxDB

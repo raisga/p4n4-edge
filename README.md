@@ -1,8 +1,8 @@
 # p4n4-edge
 
-> Dockerized **Edge AI stack** — Edge Impulse TinyML inference on the data path.
+> Dockerized **Edge AI stack** — Edge Impulse TinyML and ONNX inference on the data path.
 
-The Edge stack runs [Edge Impulse](https://edgeimpulse.com/) `.eim` models inside a lightweight Python runner. It subscribes to raw sensor data on MQTT, performs on-device inference, and publishes results back to MQTT and InfluxDB — closing the loop between IoT telemetry and AI-driven decisions.
+The Edge stack runs [Edge Impulse](https://edgeimpulse.com/) `.eim` models or [ONNX](https://onnx.ai/) `.onnx` models inside a lightweight Python runner. It subscribes to raw sensor data on MQTT, performs on-device inference, and publishes results back to MQTT and InfluxDB — closing the loop between IoT telemetry and AI-driven decisions.
 
 Attaches to the shared `p4n4-net` Docker bridge network created by [`p4n4-iot`](https://github.com/raisga/p4n4-iot), enabling seamless integration with MQTT, InfluxDB, Node-RED, and the GenAI stack.
 
@@ -17,7 +17,9 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
 - [Prerequisites](#prerequisites)
 - [Getting Started](#getting-started)
 - [Project Structure](#project-structure)
+- [Model Backends](#model-backends)
 - [Edge Impulse Models](#edge-impulse-models)
+- [ONNX Models](#onnx-models)
 - [Sensor Data Format](#sensor-data-format)
 - [Inference Results](#inference-results)
 - [Mock Mode](#mock-mode)
@@ -39,7 +41,7 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
            │
            │  (shared p4n4-net bridge)
            ▼
-      [ei-runner]         ← Edge Impulse inference runner
+      [ei-runner]         ← Inference runner (.eim / .onnx)
        /        \
       ▼           ▼
   [MQTT]      [InfluxDB]  ← publish results + write to ai_events bucket
@@ -47,7 +49,7 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
   results
 ```
 
-**Data flow:** The runner subscribes to the `sensors/raw` MQTT topic. For each message it extracts a feature vector, runs inference via the loaded `.eim` model, and publishes the result (label, confidence, anomaly score) to `inference/results`. Results are also written to the `ai_events` InfluxDB bucket for historical analysis and Grafana dashboards.
+**Data flow:** The runner subscribes to the `sensors/raw` MQTT topic. For each message it extracts a feature vector, runs inference via the loaded model (Edge Impulse `.eim` or ONNX `.onnx`), and publishes the result (label, confidence, anomaly score) to `inference/results`. Results are also written to the `ai_events` InfluxDB bucket for historical analysis and Grafana dashboards.
 
 ---
 
@@ -55,7 +57,7 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
 
 | Service | Role | Description |
 |---------|------|-------------|
-| **ei-runner** | Inference Runner | Python-based Edge Impulse runner. Loads `.eim` models, subscribes to raw sensor data on MQTT, runs on-device inference, and publishes results. Falls back to **mock mode** when no model is present. |
+| **ei-runner** | Inference Runner | Python-based inference runner. Loads Edge Impulse `.eim` models or ONNX `.onnx` models (via [ONNX Runtime](https://onnxruntime.ai/)), subscribes to raw sensor data on MQTT, runs on-device inference, and publishes results. Falls back to **mock mode** when no model is present. |
 
 ---
 
@@ -64,7 +66,7 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
 - [Docker](https://docs.docker.com/get-docker/) (v20.10+)
 - [Docker Compose](https://docs.docker.com/compose/) (v2.0+)
 - `p4n4-iot` running (or `p4n4-net` network created manually — see [Network Requirements](#network-requirements))
-- *(Optional)* An Edge Impulse `.eim` model file — download from [Edge Impulse Studio](https://studio.edgeimpulse.com) under **Deployment → Linux (x86_64 or AARCH64)**
+- *(Optional)* An Edge Impulse `.eim` model file — download from [Edge Impulse Studio](https://studio.edgeimpulse.com) under **Deployment → Linux (x86_64 or AARCH64)** — or an ONNX `.onnx` model exported from any framework (PyTorch, TensorFlow, scikit-learn, …)
 
 ---
 
@@ -87,9 +89,13 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
 3. **Deploy your model** *(optional — runs in mock mode without one)*
 
    ```bash
-   # Copy your .eim file to edge-impulse/models/
+   # Edge Impulse: copy your .eim file to edge-impulse/models/
    make deploy-model MODEL=~/Downloads/my-project-linux-aarch64-v5.eim
    # Then set EI_MODEL_FILE=my-project-linux-aarch64-v5.eim in .env
+
+   # ONNX: copy your .onnx file to onnx/models/
+   make deploy-model MODEL=~/Downloads/my-classifier.onnx
+   # Then set ONNX_MODEL_FILE=my-classifier.onnx in .env
    ```
 
 4. **Ensure `p4n4-net` exists** (skip if p4n4-iot is already running)
@@ -127,15 +133,33 @@ p4n4-edge/
 ├── .gitignore
 ├── runner/
 │   ├── Dockerfile                      # Container image for the inference runner
-│   ├── runner.py                       # Inference loop: MQTT → EI model → MQTT + InfluxDB
+│   ├── runner.py                       # Inference loop: MQTT → model → MQTT + InfluxDB
 │   └── requirements.txt                # Python dependencies
 ├── edge-impulse/
 │   └── models/
 │       └── .gitkeep                    # Place .eim files here — NEVER commit them
+├── onnx/
+│   └── models/
+│       └── .gitkeep                    # Place .onnx files here — NEVER commit them
 └── scripts/
     ├── selector.sh                     # Interactive service selector
     └── check_env_example.py            # CI: .env.example completeness check
 ```
+
+---
+
+## Model Backends
+
+The runner supports two inference backends, selected via `MODEL_BACKEND` in `.env`:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` *(default)* | Load the Edge Impulse `.eim` if present, else the ONNX `.onnx`, else mock mode |
+| `eim` | Edge Impulse only — mock mode if no `.eim` is found |
+| `onnx` | ONNX Runtime only — mock mode if no `.onnx` is found |
+| `mock` | Simulated inference, no model loaded |
+
+Only one backend is active at a time. The active backend is reported in the `mode` field of the health endpoint and every result payload (`model` = Edge Impulse, `onnx` = ONNX Runtime, `mock` = simulated).
 
 ---
 
@@ -171,6 +195,46 @@ make restart
 
 ---
 
+## ONNX Models
+
+### Obtaining a Model
+
+Export a classifier to ONNX from any major framework:
+
+```python
+# PyTorch
+torch.onnx.export(model, example_input, "my-classifier.onnx")
+
+# scikit-learn
+from skl2onnx import to_onnx
+onnx_model = to_onnx(clf, X_train[:1].astype(np.float32))
+```
+
+### Deploying a Model
+
+```bash
+# Copy via Makefile helper (routes .onnx files to onnx/models/)
+make deploy-model MODEL=~/Downloads/my-classifier.onnx
+
+# Set the filename and labels in .env
+echo "ONNX_MODEL_FILE=my-classifier.onnx" >> .env
+echo "ONNX_LABELS=idle,running,anomaly,vibration" >> .env
+
+# Restart the runner to load the new model
+make restart
+```
+
+### Model Compatibility
+
+- The runner feeds the incoming `values` array to the model's **first input** as a `float32` tensor of shape `(1, N)` — `N` must match your model's expected feature count
+- Inference runs on CPU (`CPUExecutionProvider`); use the compose override file for GPU execution providers
+- Two output shapes are handled:
+  - **Score/logit arrays** — softmax is applied automatically when the scores are not already probabilities; labels come from `ONNX_LABELS` (falling back to `class_0`, `class_1`, …)
+  - **Probability maps** (e.g. sklearn-onnx `ZipMap` output) — labels are taken from the map keys
+- ONNX models do not produce an anomaly score — `anomaly_score` is always `0.0` in `onnx` mode
+
+---
+
 ## Sensor Data Format
 
 Publish JSON to the `sensors/raw` MQTT topic (configurable via `MQTT_TOPIC_INPUT`):
@@ -185,7 +249,7 @@ Publish JSON to the `sensors/raw` MQTT topic (configurable via `MQTT_TOPIC_INPUT
 | Field | Type | Description |
 |-------|------|-------------|
 | `device` | string | Device identifier (used as InfluxDB tag) |
-| `values` | array of floats | Feature vector passed to the EI model |
+| `values` | array of floats | Feature vector passed to the model |
 
 The `values` array must match the feature count expected by your trained model.
 
@@ -213,9 +277,9 @@ The runner publishes JSON to the `inference/results` MQTT topic (configurable vi
 | `timestamp` | ISO 8601 UTC timestamp of inference |
 | `label` | Top classification label from the model |
 | `confidence` | Confidence score for the top label (0–1) |
-| `anomaly_score` | Anomaly score from the model (0–1; higher = more anomalous) |
+| `anomaly_score` | Anomaly score from the model (0–1; higher = more anomalous; always `0.0` in `onnx` mode) |
 | `latency_ms` | Inference latency in milliseconds |
-| `mode` | `"model"` when running a real `.eim`, `"mock"` in mock mode |
+| `mode` | `"model"` when running a `.eim`, `"onnx"` when running a `.onnx`, `"mock"` in mock mode |
 
 Results are also written to the `ai_events` InfluxDB bucket with the measurement name `inference_result`.
 
@@ -223,7 +287,7 @@ Results are also written to the `ai_events` InfluxDB bucket with the measurement
 
 ## Mock Mode
 
-When no `.eim` model file is found (or the Edge Impulse SDK cannot be loaded), the runner enters **mock mode** automatically:
+When no model file is found (or the selected backend cannot be loaded), the runner enters **mock mode** automatically:
 
 - Simulated inference results are generated based on input magnitude
 - Labels are sampled from `["idle", "running", "anomaly", "vibration"]`
@@ -253,7 +317,7 @@ make build            # Rebuild the runner image
 make start SERVICE=ei-runner   # Start a single service
 make stop SERVICE=ei-runner    # Stop a single service
 
-make deploy-model MODEL=path/to/model.eim   # Deploy a .eim model
+make deploy-model MODEL=path/to/model.eim   # Deploy a .eim or .onnx model
 make test-inference   # Send test data and print results
 
 make clean            # Stop services and remove all data volumes
@@ -341,7 +405,7 @@ p4n4 up --edge   # start Edge stack
 
 2. **InfluxDB token** — use a scoped token (write-only to `ai_events`) rather than the admin token in production.
 
-3. **Model files** — `.eim` files are excluded from version control by `.gitignore`. Do not commit them.
+3. **Model files** — `.eim` and `.onnx` files are excluded from version control by `.gitignore`. Do not commit them.
 
 4. **EI_API_KEY** — only required for Edge Impulse cloud features (e.g., continuous learning). Leave blank for fully offline deployments.
 
@@ -394,6 +458,8 @@ When running alongside p4n4-iot on the same `p4n4-net` network, services can be 
 - [Edge Impulse Studio](https://studio.edgeimpulse.com) — train and export models
 - [Edge Impulse Linux SDK](https://docs.edgeimpulse.com/docs/run-inference/linux) — runner documentation
 - [Edge Impulse Python SDK](https://pypi.org/project/edge-impulse-linux/) — PyPI package
+- [ONNX](https://onnx.ai/) — open model interchange format
+- [ONNX Runtime](https://onnxruntime.ai/) — cross-platform inference engine
 
 ---
 

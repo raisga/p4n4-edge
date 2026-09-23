@@ -14,9 +14,14 @@ services:
     ports:
       - "8080:8080"   # Health / status API
     environment:
+      # Model backend: auto | eim | onnx | mock
+      MODEL_BACKEND: ${MODEL_BACKEND:-auto}
       # Edge Impulse model file (place .eim in edge-impulse/models/)
       EI_MODEL_PATH: /models/${EI_MODEL_FILE:-model.eim}
       EI_API_KEY: ${EI_API_KEY:-}
+      # ONNX model file (place .onnx in onnx/models/)
+      ONNX_MODEL_PATH: /onnx-models/${ONNX_MODEL_FILE:-model.onnx}
+      ONNX_LABELS: ${ONNX_LABELS:-}
       # MQTT broker (shared with p4n4-iot — must match values in p4n4-iot .env)
       MQTT_HOST: ${MQTT_HOST:-p4n4-mqtt}
       MQTT_PORT: ${MQTT_PORT:-1883}
@@ -31,8 +36,9 @@ services:
       INFLUXDB_BUCKET: ${INFLUXDB_BUCKET_AI_EVENTS:-ai_events}
       TZ: ${TZ:-UTC}
     volumes:
-      # Mount model directory read-only — place .eim files here at deploy time
+      # Mount model directories read-only — place model files here at deploy time
       - ./edge-impulse/models:/models:ro
+      - ./onnx/models:/onnx-models:ro
       - ei-runner-data:/data
     healthcheck:
       test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:8080/health || exit 1"]

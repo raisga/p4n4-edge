@@ -39,9 +39,10 @@ help:
 	@printf "    $(GREEN)make start SERVICE=x$(NC) Start a service + its deps\n"
 	@printf "    $(GREEN)make stop SERVICE=x$(NC)  Stop a service (warns about deps)\n"
 	@echo ""
-	@printf "  $(BOLD)Edge Impulse:$(NC)\n"
-	@printf "    $(GREEN)make deploy-model MODEL=path/to/model.eim$(NC)\n"
+	@printf "  $(BOLD)Models:$(NC)\n"
+	@printf "    $(GREEN)make deploy-model MODEL=path/to/model.{eim,onnx}$(NC)\n"
 	@printf "                         Copy a .eim model to edge-impulse/models/\n"
+	@printf "                         or a .onnx model to onnx/models/\n"
 	@echo ""
 	@printf "  $(BOLD)Testing:$(NC)\n"
 	@printf "    $(GREEN)make test-inference$(NC)  Send test sensor data to MQTT\n"
@@ -172,19 +173,30 @@ endif
 	@printf "$(GREEN)$(BOLD)  Done!$(NC)\n"
 
 # ------------------------------------------------------------------------------
-# Edge Impulse Model Deployment
+# Model Deployment (.eim → edge-impulse/models/, .onnx → onnx/models/)
 # ------------------------------------------------------------------------------
 
 deploy-model:
 ifndef MODEL
-	@printf "$(RED)  Usage: make deploy-model MODEL=path/to/model.eim$(NC)\n"
+	@printf "$(RED)  Usage: make deploy-model MODEL=path/to/model.eim|model.onnx$(NC)\n"
 	@exit 1
 endif
 	@printf "$(CYAN)  Deploying model: $(BOLD)$(MODEL)$(NC)\n"
-	@cp "$(MODEL)" edge-impulse/models/
-	@printf "$(GREEN)  Model copied to edge-impulse/models/$(NC)\n"
-	@printf "$(YELLOW)  Set EI_MODEL_FILE=$(notdir $(MODEL)) in your .env, then restart:$(NC)\n"
-	@printf "$(YELLOW)    make restart$(NC)\n"
+	@case "$(MODEL)" in \
+	*.eim) \
+		cp "$(MODEL)" edge-impulse/models/; \
+		printf "$(GREEN)  Model copied to edge-impulse/models/$(NC)\n"; \
+		printf "$(YELLOW)  Set EI_MODEL_FILE=$(notdir $(MODEL)) in your .env, then restart:$(NC)\n"; \
+		printf "$(YELLOW)    make restart$(NC)\n" ;; \
+	*.onnx) \
+		cp "$(MODEL)" onnx/models/; \
+		printf "$(GREEN)  Model copied to onnx/models/$(NC)\n"; \
+		printf "$(YELLOW)  Set ONNX_MODEL_FILE=$(notdir $(MODEL)) in your .env, then restart:$(NC)\n"; \
+		printf "$(YELLOW)    make restart$(NC)\n" ;; \
+	*) \
+		printf "$(RED)  Unsupported model type: $(MODEL) (expected .eim or .onnx)$(NC)\n"; \
+		exit 1 ;; \
+	esac
 
 # ------------------------------------------------------------------------------
 # Testing Commands

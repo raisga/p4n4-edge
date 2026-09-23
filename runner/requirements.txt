@@ -1,3 +1,5 @@
 edge_impulse_linux>=1.0
+onnxruntime>=1.17
+numpy>=1.26
 paho-mqtt>=2.0
 influxdb-client>=1.40

@@ -1,6 +1,6 @@
 """
-Stub heavy optional dependencies (edge_impulse_linux, influxdb_client)
-before any test module imports runner.py.
+Stub heavy optional dependencies (edge_impulse_linux, onnxruntime, numpy,
+influxdb_client) before any test module imports runner.py.
 """
 
 from __future__ import annotations
@@ -18,6 +18,22 @@ _ei_runner_stub.ImpulseRunner = MagicMock()
 _ei_stub.runner = _ei_runner_stub
 sys.modules.setdefault("edge_impulse_linux", _ei_stub)
 sys.modules.setdefault("edge_impulse_linux.runner", _ei_runner_stub)
+
+# ---------------------------------------------------------------------------
+# onnxruntime + numpy stubs
+# ---------------------------------------------------------------------------
+_ort_stub = ModuleType("onnxruntime")
+_ort_stub.InferenceSession = MagicMock()
+sys.modules.setdefault("onnxruntime", _ort_stub)
+
+_np_stub = ModuleType("numpy")
+_np_stub.asarray = MagicMock(return_value=MagicMock())
+_np_stub.float32 = MagicMock()
+# pytest.approx introspects sys.modules["numpy"] — keep these functional
+_np_stub.isscalar = lambda obj: False
+_np_stub.ndarray = type("ndarray", (), {})
+_np_stub.bool_ = type("bool_", (), {})
+sys.modules.setdefault("numpy", _np_stub)
 
 # ---------------------------------------------------------------------------
 # influxdb_client stub

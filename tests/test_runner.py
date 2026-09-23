@@ -42,6 +42,8 @@ def _make_mqtt_message(payload: object, topic: str = "sensors/raw") -> MagicMock
 def _reset_globals():
     """Reset mutable module-level state between tests."""
     R._runner = None
+    R._onnx_session = None
+    R._onnx_input_name = None
     R._influx_write_api = None
     R._state.update(
         {
@@ -131,6 +133,107 @@ class TestModelInference:
         result = R._run_inference([1.0, 2.0])
 
         assert result["mode"] == "mock"
+
+
+# ---------------------------------------------------------------------------
+# _run_inference — ONNX mode (mocked InferenceSession)
+# ---------------------------------------------------------------------------
+
+class TestOnnxInference:
+    def _make_session(self, outputs):
+        session = MagicMock()
+        session.run.return_value = outputs
+        R._onnx_session = session
+        R._onnx_input_name = "input"
+        return session
+
+    def test_returns_onnx_mode_with_probability_output(self):
+        # Output already sums to 1 — used as-is
+        self._make_session([[0.1, 0.7, 0.2]])
+
+        with patch.object(R, "ONNX_LABELS", ["idle", "running", "anomaly"]):
+            result = R._run_inference([1.0, 2.0, 3.0])
+
+        assert result["mode"] == "onnx"
+        assert result["label"] == "running"
+        assert result["confidence"] == pytest.approx(0.7, abs=1e-4)
+
+    def test_applies_softmax_to_logits(self):
+        self._make_session([[2.0, -1.0, 0.5]])
+
+        result = R._run_inference([1.0, 2.0])
+
+        assert result["mode"] == "onnx"
+        assert result["label"] == "class_0"
+        assert 0.0 <= result["confidence"] <= 1.0
+
+    def test_handles_zipmap_dict_output(self):
+        self._make_session([[{"idle": 0.2, "anomaly": 0.8}]])
+
+        result = R._run_inference([1.0, 2.0])
+
+        assert result["mode"] == "onnx"
+        assert result["label"] == "anomaly"
+        assert result["confidence"] == pytest.approx(0.8, abs=1e-4)
+
+    def test_unnamed_classes_fall_back_to_class_index(self):
+        self._make_session([[0.1, 0.9]])
+
+        with patch.object(R, "ONNX_LABELS", []):
+            result = R._run_inference([1.0])
+
+        assert result["label"] == "class_1"
+
+    def test_falls_back_to_mock_on_session_exception(self):
+        session = MagicMock()
+        session.run.side_effect = RuntimeError("bad input shape")
+        R._onnx_session = session
+        R._onnx_input_name = "input"
+
+        result = R._run_inference([1.0, 2.0])
+
+        assert result["mode"] == "mock"
+
+
+# ---------------------------------------------------------------------------
+# _load_backend — backend selection
+# ---------------------------------------------------------------------------
+
+class TestLoadBackend:
+    def test_auto_prefers_eim(self):
+        with patch.object(R, "MODEL_BACKEND", "auto"), \
+             patch.object(R, "_load_model", return_value=True) as load_eim, \
+             patch.object(R, "_load_onnx_model", return_value=True) as load_onnx:
+            assert R._load_backend() == "model"
+        load_eim.assert_called_once()
+        load_onnx.assert_not_called()
+
+    def test_auto_falls_back_to_onnx(self):
+        with patch.object(R, "MODEL_BACKEND", "auto"), \
+             patch.object(R, "_load_model", return_value=False), \
+             patch.object(R, "_load_onnx_model", return_value=True):
+            assert R._load_backend() == "onnx"
+
+    def test_auto_falls_back_to_mock(self):
+        with patch.object(R, "MODEL_BACKEND", "auto"), \
+             patch.object(R, "_load_model", return_value=False), \
+             patch.object(R, "_load_onnx_model", return_value=False):
+            assert R._load_backend() == "mock"
+
+    def test_onnx_backend_skips_eim(self):
+        with patch.object(R, "MODEL_BACKEND", "onnx"), \
+             patch.object(R, "_load_model", return_value=True) as load_eim, \
+             patch.object(R, "_load_onnx_model", return_value=True):
+            assert R._load_backend() == "onnx"
+        load_eim.assert_not_called()
+
+    def test_mock_backend_loads_nothing(self):
+        with patch.object(R, "MODEL_BACKEND", "mock"), \
+             patch.object(R, "_load_model", return_value=True) as load_eim, \
+             patch.object(R, "_load_onnx_model", return_value=True) as load_onnx:
+            assert R._load_backend() == "mock"
+        load_eim.assert_not_called()
+        load_onnx.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
