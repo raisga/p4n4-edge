@@ -1,0 +1,21 @@
+# Normalize line endings to LF in the repository and working tree.
+* text=auto eol=lf
+
+# Binary files: no line-ending conversion or text diffs.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.mp4  binary
+*.webm binary
+*.pdf  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.zip  binary
+*.gz   binary
+*.onnx binary
+*.eim  binary

@@ -183,8 +183,8 @@ cp ~/Downloads/my-model-linux-x86_64-v7.eim edge-impulse/models/
 # Set the filename in .env
 echo "EI_MODEL_FILE=my-model-linux-x86_64-v7.eim" >> .env
 
-# Restart the runner to load the new model
-make restart
+# Recreate the runner to load the new model (make restart keeps the old .env values)
+make up
 ```
 
 ### Model Compatibility
@@ -220,8 +220,8 @@ make deploy-model MODEL=~/Downloads/my-classifier.onnx
 echo "ONNX_MODEL_FILE=my-classifier.onnx" >> .env
 echo "ONNX_LABELS=idle,running,anomaly,vibration" >> .env
 
-# Restart the runner to load the new model
-make restart
+# Recreate the runner to load the new model (make restart keeps the old .env values)
+make up
 ```
 
 ### Model Compatibility
@@ -308,7 +308,7 @@ make help             # Show all available commands
 
 make up               # Build and start the full stack
 make down             # Stop all services
-make restart          # Restart all services
+make restart          # Restart all services (does not apply .env changes; use make up)
 make logs             # Follow logs from all services
 make ps               # Show service status
 make status           # Colorized status table

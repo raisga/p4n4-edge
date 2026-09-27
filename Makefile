@@ -186,13 +186,13 @@ endif
 	*.eim) \
 		cp "$(MODEL)" edge-impulse/models/; \
 		printf "$(GREEN)  Model copied to edge-impulse/models/$(NC)\n"; \
-		printf "$(YELLOW)  Set EI_MODEL_FILE=$(notdir $(MODEL)) in your .env, then restart:$(NC)\n"; \
-		printf "$(YELLOW)    make restart$(NC)\n" ;; \
+		printf "$(YELLOW)  Set EI_MODEL_FILE=$(notdir $(MODEL)) in your .env, then recreate the runner:$(NC)\n"; \
+		printf "$(YELLOW)    make up$(NC)\n" ;; \
 	*.onnx) \
 		cp "$(MODEL)" onnx/models/; \
 		printf "$(GREEN)  Model copied to onnx/models/$(NC)\n"; \
-		printf "$(YELLOW)  Set ONNX_MODEL_FILE=$(notdir $(MODEL)) in your .env, then restart:$(NC)\n"; \
-		printf "$(YELLOW)    make restart$(NC)\n" ;; \
+		printf "$(YELLOW)  Set ONNX_MODEL_FILE=$(notdir $(MODEL)) in your .env, then recreate the runner:$(NC)\n"; \
+		printf "$(YELLOW)    make up$(NC)\n" ;; \
 	*) \
 		printf "$(RED)  Unsupported model type: $(MODEL) (expected .eim or .onnx)$(NC)\n"; \
 		exit 1 ;; \
