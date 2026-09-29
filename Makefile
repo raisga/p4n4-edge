@@ -203,15 +203,15 @@ endif
 # ------------------------------------------------------------------------------
 
 test-inference:
-	@printf "$(CYAN)  Publishing test sensor data to MQTT (topic: sensors/raw)...$(NC)\n"
+	@printf "$(CYAN)  Publishing test sensor data to MQTT (topic: sensors/test-sensor-01/raw)...$(NC)\n"
 	@docker run --rm --network p4n4-net eclipse-mosquitto:2 \
-		mosquitto_pub -h p4n4-mqtt -t 'sensors/raw' \
-		-m '{"device":"test-sensor-01","values":[1.23,4.56,7.89,0.12,3.45,6.78]}' \
+		mosquitto_pub -h p4n4-mqtt -t 'sensors/test-sensor-01/raw' \
+		-m '{"values":[1.23,4.56,7.89,0.12,3.45,6.78]}' \
 		2>/dev/null \
 		|| printf "$(RED)  Could not connect to p4n4-mqtt. Is p4n4-iot running?$(NC)\n"
 	@echo ""
-	@printf "$(CYAN)  Subscribing to inference/results for 3 seconds...$(NC)\n"
+	@printf "$(CYAN)  Subscribing to inference/test-sensor-01/result for 3 seconds...$(NC)\n"
 	@docker run --rm --network p4n4-net eclipse-mosquitto:2 \
-		mosquitto_sub -h p4n4-mqtt -t 'inference/results' -W 3 \
+		mosquitto_sub -h p4n4-mqtt -t 'inference/test-sensor-01/result' -W 3 \
 		2>/dev/null \
 		|| printf "$(DIM)  No results received (check ei-runner logs: make logs)$(NC)\n"

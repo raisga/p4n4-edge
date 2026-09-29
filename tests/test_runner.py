@@ -28,7 +28,7 @@ import runner as R  # noqa: E402  (conftest stubs must load first)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_mqtt_message(payload: object, topic: str = "sensors/raw") -> MagicMock:
+def _make_mqtt_message(payload: object, topic: str = "sensors/dev-01/raw") -> MagicMock:
     """Build a fake paho MQTTMessage-like object."""
     msg = MagicMock()
     msg.topic = topic
@@ -249,9 +249,32 @@ class TestOnMessage:
 
         client.publish.assert_called_once()
         topic, payload = client.publish.call_args[0]
-        assert topic == R.MQTT_TOPIC_RESULTS
+        assert topic == "inference/dev-01/result"
         data = json.loads(payload)
         assert data["device"] == "dev-01"
+
+    def test_results_topic_uses_topic_device(self):
+        client = MagicMock()
+        msg = _make_mqtt_message({"values": [1.0]}, "sensors/press-7/raw")
+
+        R._on_message(client, None, msg)
+
+        topic, _ = client.publish.call_args[0]
+        assert topic == "inference/press-7/result"
+
+    def test_results_topic_keeps_payload_device_to_one_level(self):
+        client = MagicMock()
+        msg = _make_mqtt_message({"device": "a/b+#", "values": [1.0]}, "custom/input")
+
+        R._on_message(client, None, msg)
+
+        topic, payload = client.publish.call_args[0]
+        assert topic == "inference/a_b__/result"
+        assert json.loads(payload)["device"] == "a/b+#"
+
+    def test_results_topic_without_placeholder_is_fixed(self):
+        with patch.object(R, "MQTT_TOPIC_RESULTS", "inference/results"):
+            assert R._results_topic("dev-01") == "inference/results"
 
     def test_result_payload_has_expected_keys(self):
         client = MagicMock()
@@ -307,9 +330,35 @@ class TestOnMessage:
 
         client.publish.assert_not_called()
 
+    def test_takes_device_from_topic(self):
+        client = MagicMock()
+        msg = _make_mqtt_message({"device": "payload-dev", "values": [1.0]}, "sensors/topic-dev/raw")
+
+        R._on_message(client, None, msg)
+
+        _, payload = client.publish.call_args[0]
+        assert json.loads(payload)["device"] == "topic-dev"
+
+    def test_falls_back_to_payload_device_for_other_topics(self):
+        client = MagicMock()
+        msg = _make_mqtt_message({"device": "payload-dev", "values": [1.0]}, "custom/input")
+
+        R._on_message(client, None, msg)
+
+        _, payload = client.publish.call_args[0]
+        assert json.loads(payload)["device"] == "payload-dev"
+
+    def test_ignores_non_object_payload(self):
+        client = MagicMock()
+        msg = _make_mqtt_message([1.0, 2.0])
+
+        R._on_message(client, None, msg)
+
+        client.publish.assert_not_called()
+
     def test_uses_unknown_device_when_missing(self):
         client = MagicMock()
-        msg = _make_mqtt_message({"values": [1.0, 2.0]})  # no "device" key
+        msg = _make_mqtt_message({"values": [1.0, 2.0]}, "custom/input")  # no device anywhere
 
         R._on_message(client, None, msg)
 
@@ -391,3 +440,107 @@ class TestHealthEndpoint:
             assert False, "expected HTTPError"
         except urllib.error.HTTPError as exc:
             assert exc.code == 404
+
+
+# ---------------------------------------------------------------------------
+# Inference API (/api/v1/info, /api/v1/infer)
+# ---------------------------------------------------------------------------
+
+def _serve_one_request():
+    import threading
+    from http.server import HTTPServer
+
+    server = HTTPServer(("127.0.0.1", 0), R._HealthHandler)
+    thread = threading.Thread(target=server.handle_request)
+    thread.daemon = True
+    thread.start()
+    return f"http://127.0.0.1:{server.server_address[1]}"
+
+
+def _post(path, body):
+    base = _serve_one_request()
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    req = urllib.request.Request(
+        base + path, data=data, method="POST", headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+class TestInfoEndpoint:
+    def test_returns_backend_and_model(self):
+        R._state["mode"] = "mock"
+        with urllib.request.urlopen(_serve_one_request() + "/api/v1/info") as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read())
+
+        assert body["backend"] == "mock"
+        assert body["model_file"] is None
+        assert "model" in body
+        assert body["mqtt_topic_input"] == R.MQTT_TOPIC_INPUT
+
+    def test_reports_onnx_model_file_and_labels(self):
+        R._state["mode"] = "onnx"
+        R._state["model_file"] = "/onnx-models/m.onnx"
+        with patch.object(R, "ONNX_LABELS", ["idle", "running"]):
+            body = R._info()
+
+        assert body["model_file"] == "/onnx-models/m.onnx"
+        assert body["labels"] == ["idle", "running"]
+
+
+class TestInferEndpoint:
+    def setup_method(self):
+        R._runner = None
+        R._onnx_session = None
+        R._state["inference_count"] = 0
+
+    def test_returns_inference_result(self):
+        status, body = _post("/api/v1/infer", {"values": [1.2, 4.5, 7.8], "device": "bench"})
+
+        assert status == 200
+        assert body["device"] == "bench"
+        assert body["mode"] == "mock"
+        for key in ("label", "confidence", "anomaly_score", "latency_ms", "timestamp"):
+            assert key in body
+
+    def test_does_not_publish_store_or_count(self):
+        mock_api = MagicMock()
+        R._influx_write_api = mock_api
+
+        status, _ = _post("/api/v1/infer", {"values": [1.0]})
+
+        assert status == 200
+        mock_api.write.assert_not_called()
+        assert R._state["inference_count"] == 0
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            [1, 2, 3],
+            {},
+            {"values": []},
+            {"values": "1,2,3"},
+            {"values": [1, "2"]},
+            {"values": [True, 1.0]},
+        ],
+    )
+    def test_rejects_invalid_body(self, body):
+        status, resp = _post("/api/v1/infer", body)
+        assert status == 400
+        assert "error" in resp
+
+    def test_rejects_non_json(self):
+        status, _ = _post("/api/v1/infer", b"not json")
+        assert status == 400
+
+    def test_rejects_oversized_body(self):
+        status, _ = _post("/api/v1/infer", b"x" * (R.MAX_INFER_BODY_BYTES + 1))
+        assert status == 413
+
+    def test_unknown_post_path_returns_404(self):
+        status, _ = _post("/api/v1/other", {"values": [1.0]})
+        assert status == 404

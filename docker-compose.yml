@@ -27,8 +27,8 @@ services:
       MQTT_PORT: ${MQTT_PORT:-1883}
       MQTT_USER: ${MQTT_USER:-}
       MQTT_PASSWORD: ${MQTT_PASSWORD:-}
-      MQTT_TOPIC_INPUT: ${MQTT_TOPIC_INPUT:-sensors/raw}
-      MQTT_TOPIC_RESULTS: ${MQTT_TOPIC_RESULTS:-inference/results}
+      MQTT_TOPIC_INPUT: ${MQTT_TOPIC_INPUT:-sensors/+/raw}
+      MQTT_TOPIC_RESULTS: ${MQTT_TOPIC_RESULTS:-inference/{device}/result}
       # InfluxDB (shared with p4n4-iot — must match values in p4n4-iot .env)
       INFLUXDB_URL: http://p4n4-influxdb:8086
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-p4n4-stack-token}

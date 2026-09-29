@@ -46,10 +46,11 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
       ▼           ▼
   [MQTT]      [InfluxDB]  ← publish results + write to ai_events bucket
   inference/  ai_events
-  results
+  <device>/
+  result
 ```
 
-**Data flow:** The runner subscribes to the `sensors/raw` MQTT topic. For each message it extracts a feature vector, runs inference via the loaded model (Edge Impulse `.eim` or ONNX `.onnx`), and publishes the result (label, confidence, anomaly score) to `inference/results`. Results are also written to the `ai_events` InfluxDB bucket for historical analysis and Grafana dashboards.
+**Data flow:** The runner subscribes to `sensors/+/raw`, the `raw` measurement of every device (`sensors/<device-id>/raw`). For each message it extracts a feature vector, runs inference via the loaded model (Edge Impulse `.eim` or ONNX `.onnx`), and publishes the result (label, confidence, anomaly score) to `inference/<device-id>/result`. Results are also written to the `ai_events` InfluxDB bucket for historical analysis and Grafana dashboards.
 
 ---
 
@@ -237,19 +238,20 @@ make up
 
 ## Sensor Data Format
 
-Publish JSON to the `sensors/raw` MQTT topic (configurable via `MQTT_TOPIC_INPUT`):
+Publish JSON to `sensors/<device-id>/raw`, for example `sensors/vibration-sensor-01/raw`. The subscription is configurable via `MQTT_TOPIC_INPUT` (default `sensors/+/raw`).
 
 ```json
 {
-  "device": "vibration-sensor-01",
   "values": [1.23, 4.56, 7.89, 0.12, 3.45, 6.78]
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `device` | string | Device identifier (used as InfluxDB tag) |
 | `values` | array of floats | Feature vector passed to the model |
+| `device` | string | Optional. Device identifier, used only when the topic doesn't follow `sensors/<device-id>/raw` |
+
+The device in the topic becomes the `device` field of the result and its InfluxDB tag.
 
 The `values` array must match the feature count expected by your trained model.
 
@@ -257,7 +259,7 @@ The `values` array must match the feature count expected by your trained model.
 
 ## Inference Results
 
-The runner publishes JSON to the `inference/results` MQTT topic (configurable via `MQTT_TOPIC_RESULTS`):
+The runner publishes JSON to `inference/<device-id>/result`, using the device from the input topic. The topic is configurable via `MQTT_TOPIC_RESULTS` (default `inference/{device}/result`, where `{device}` is replaced by the device id):
 
 ```json
 {
@@ -273,7 +275,7 @@ The runner publishes JSON to the `inference/results` MQTT topic (configurable vi
 
 | Field | Description |
 |-------|-------------|
-| `device` | Echoed from the input message |
+| `device` | Device id from the input topic (or the payload's `device` for a custom `MQTT_TOPIC_INPUT`) |
 | `timestamp` | ISO 8601 UTC timestamp of inference |
 | `label` | Top classification label from the model |
 | `confidence` | Confidence score for the top label (0–1) |
@@ -342,17 +344,35 @@ curl http://localhost:8080/health
 }
 ```
 
+### Testing a Model over HTTP
+
+`POST /api/v1/infer` runs inference on one sample and returns the result. Unlike a message on `sensors/<device-id>/raw`, the sample and result aren't published to MQTT or written to InfluxDB, so Node-RED and n8n don't see them.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/infer \
+  -H "Content-Type: application/json" \
+  -d '{"values": [1.2, 4.5, 7.8], "device": "bench"}'
+```
+
+The response has the same fields as a result on `inference/<device-id>/result`. `device` is optional and defaults to `api`. An invalid body returns 400 with an `error` field.
+
+`GET /api/v1/info` returns the active backend, the model file, details read from the model (the project and labels for Edge Impulse, the input name and shape for ONNX), the configured `ONNX_LABELS` and the MQTT topics.
+
+```bash
+curl http://localhost:8080/api/v1/info
+```
+
 ### Sending Sensor Data Manually
 
 ```bash
 # From host via mosquitto_pub
-mosquitto_pub -h localhost -p 1883 -t sensors/raw \
-  -m '{"device":"bench-sensor","values":[1.2,3.4,5.6,0.1,2.3,4.5]}'
+mosquitto_pub -h localhost -p 1883 -t sensors/bench-sensor/raw \
+  -m '{"values":[1.2,3.4,5.6,0.1,2.3,4.5]}'
 
 # From another container on p4n4-net
 docker run --rm --network p4n4-net eclipse-mosquitto:2 \
-  mosquitto_pub -h p4n4-mqtt -t sensors/raw \
-  -m '{"device":"bench-sensor","values":[1.2,3.4,5.6,0.1,2.3,4.5]}'
+  mosquitto_pub -h p4n4-mqtt -t sensors/bench-sensor/raw \
+  -m '{"values":[1.2,3.4,5.6,0.1,2.3,4.5]}'
 ```
 
 ---
@@ -409,7 +429,7 @@ p4n4 up --edge   # start Edge stack
 
 4. **EI_API_KEY** — only required for Edge Impulse cloud features (e.g., continuous learning). Leave blank for fully offline deployments.
 
-5. **Restrict port exposure** — for production, remove the `8080` host-port binding and access the health endpoint only within `p4n4-net`.
+5. **Restrict port exposure** — for production, remove the `8080` host-port binding and access the health and inference endpoints only within `p4n4-net`.
 
 ---
 
@@ -446,7 +466,7 @@ When running alongside p4n4-iot on the same `p4n4-net` network, services can be 
 | `INFLUXDB_BUCKET_AI_EVENTS` | InfluxDB bucket for AI events (`ai_events`) |
 | `MQTT_USER` / `MQTT_PASSWORD` | MQTT authentication |
 
-**Recommended Node-RED integration:** Subscribe to `inference/results` in a Node-RED flow to route high-anomaly events (anomaly_score > 0.8) to the p4n4-ai stack's Ollama for natural-language explanations.
+**Recommended Node-RED integration:** Subscribe to `inference/+/result` in a Node-RED flow to route high-anomaly events (anomaly_score > 0.8) to the p4n4-ai stack's Ollama for natural-language explanations.
 
 ---
 

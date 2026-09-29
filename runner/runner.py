@@ -9,6 +9,12 @@ MQTT and InfluxDB (ai_events bucket).
 When no model is found, the runner operates in mock mode and generates
 simulated inference results so the full pipeline can be tested end-to-end.
 
+HTTP endpoints (on HEALTH_PORT):
+  GET  /health, /      Runner status
+  GET  /api/v1/info    Backend and model details
+  POST /api/v1/infer   Run inference on {"values": [...]} and return the result,
+                       without publishing it to MQTT or writing it to InfluxDB
+
 Environment variables (see .env.example):
   MODEL_BACKEND       Backend selection: auto | eim | onnx | mock (default: auto)
   EI_MODEL_PATH       Path to the .eim model file (default: /models/model.eim)
@@ -19,8 +25,10 @@ Environment variables (see .env.example):
   MQTT_PORT           MQTT broker port (default: 1883)
   MQTT_USER           MQTT username (optional)
   MQTT_PASSWORD       MQTT password (optional)
-  MQTT_TOPIC_INPUT    Topic to subscribe for raw sensor data (default: sensors/raw)
-  MQTT_TOPIC_RESULTS  Topic to publish inference results (default: inference/results)
+  MQTT_TOPIC_INPUT    Topic to subscribe for raw sensor data (default: sensors/+/raw,
+                      i.e. sensors/<device-id>/raw)
+  MQTT_TOPIC_RESULTS  Topic to publish inference results; {device} is replaced by the
+                      device id (default: inference/{device}/result)
   INFLUXDB_URL        InfluxDB URL (default: http://p4n4-influxdb:8086)
   INFLUXDB_TOKEN      InfluxDB API token
   INFLUXDB_ORG        InfluxDB organization
@@ -81,13 +89,14 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "p4n4-mqtt")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
-MQTT_TOPIC_INPUT = os.environ.get("MQTT_TOPIC_INPUT", "sensors/raw")
-MQTT_TOPIC_RESULTS = os.environ.get("MQTT_TOPIC_RESULTS", "inference/results")
+MQTT_TOPIC_INPUT = os.environ.get("MQTT_TOPIC_INPUT", "sensors/+/raw")
+MQTT_TOPIC_RESULTS = os.environ.get("MQTT_TOPIC_RESULTS", "inference/{device}/result")
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://p4n4-influxdb:8086")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN", "")
 INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "ming")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "ai_events")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
+MAX_INFER_BODY_BYTES = 1024 * 1024
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -114,8 +123,12 @@ _state: dict[str, Any] = {
 _runner: ImpulseRunner | None = None
 _onnx_session = None
 _onnx_input_name: str | None = None
+_model_info: dict[str, Any] = {}
 _influx_write_api = None
 _lock = threading.Lock()
+# Serializes model calls: the MQTT loop and the HTTP server run in separate
+# threads, and the Edge Impulse runner talks to its model over one socket.
+_infer_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -123,27 +136,94 @@ _lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 class _HealthHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status: int, data: dict) -> None:
+        body = json.dumps(data, indent=2, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path in ("/health", "/"):
-            body = json.dumps(
-                {
-                    "status": "ok",
-                    **_state,
-                },
-                indent=2,
-                default=str,
-            ).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            with _lock:
+                state = dict(_state)
+            self._send_json(200, {"status": "ok", **state})
+        elif self.path == "/api/v1/info":
+            self._send_json(200, _info())
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/api/v1/infer":
+            self._send_json(404, {"error": "not found"})
+            return
+
+        length_header = self.headers.get("Content-Length")
+        if length_header is None:
+            self._send_json(411, {"error": "Content-Length required"})
+            return
+        try:
+            length = int(length_header)
+        except ValueError:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return
+        if length < 0 or length > MAX_INFER_BODY_BYTES:
+            self._send_json(413, {"error": f"body must be at most {MAX_INFER_BODY_BYTES} bytes"})
+            return
+
+        try:
+            payload = json.loads(self.rfile.read(length).decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json(400, {"error": "body must be JSON"})
+            return
+
+        error = _validate_infer_payload(payload)
+        if error:
+            self._send_json(400, {"error": error})
+            return
+
+        with _infer_lock:
+            inference = _run_inference([float(v) for v in payload["values"]])
+        self._send_json(
+            200,
+            {
+                "device": str(payload.get("device", "api")),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                **inference,
+            },
+        )
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: ANN401
         pass  # suppress HTTP access logs
+
+
+def _validate_infer_payload(payload: Any) -> str | None:
+    """Return an error message for an invalid /api/v1/infer body, else None."""
+    if not isinstance(payload, dict):
+        return "body must be a JSON object"
+    values = payload.get("values")
+    if not isinstance(values, list) or not values:
+        return "'values' must be a non-empty array of numbers"
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values):
+        return "'values' must contain only numbers"
+    return None
+
+
+def _info() -> dict:
+    """Backend and model details for GET /api/v1/info."""
+    with _lock:
+        mode = _state["mode"]
+        model_file = _state["model_file"]
+    return {
+        "backend": mode,
+        "model_backend_setting": MODEL_BACKEND,
+        "model_file": None if mode == "mock" else model_file,
+        "model": _model_info,
+        "labels": ONNX_LABELS if mode == "onnx" else [],
+        "mqtt_topic_input": MQTT_TOPIC_INPUT,
+        "mqtt_topic_results": MQTT_TOPIC_RESULTS,
+    }
 
 
 def _start_health_server() -> None:
@@ -228,6 +308,16 @@ def _load_model() -> bool:
         log.info("Loading Edge Impulse model: %s", MODEL_PATH)
         _runner = ImpulseRunner(MODEL_PATH)
         model_info = _runner.init()
+        params = model_info.get("model_parameters", {})
+        _model_info.clear()
+        _model_info.update(
+            {
+                "project": model_info.get("project", {}).get("name"),
+                "input_features_count": params.get("input_features_count"),
+                "labels": params.get("labels", []),
+                "has_anomaly": bool(params.get("has_anomaly")),
+            }
+        )
         log.info(
             "Model loaded: %s (DSP=%dms, classification=%dms, anomaly=%dms)",
             model_info.get("project", {}).get("name", "unknown"),
@@ -271,6 +361,8 @@ def _load_onnx_model() -> bool:
         session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
         inp = session.get_inputs()[0]
         log.info("ONNX model loaded: input '%s' shape=%s", inp.name, inp.shape)
+        _model_info.clear()
+        _model_info.update({"input_name": inp.name, "input_shape": list(inp.shape)})
         _onnx_session = session
         _onnx_input_name = inp.name
         return True
@@ -408,6 +500,24 @@ def _on_disconnect(client: mqtt.Client, userdata: Any, rc: int, props=None) -> N
     log.warning("MQTT disconnected (rc=%d) — will reconnect", rc)
 
 
+def _device_from_topic(topic: str) -> str | None:
+    """Device id from a sensors/<device-id>/<measurement> topic, else None."""
+    parts = topic.split("/")
+    if len(parts) == 3 and parts[0] == "sensors" and parts[1]:
+        return parts[1]
+    return None
+
+
+def _results_topic(device: str) -> str:
+    """Result topic for a device: MQTT_TOPIC_RESULTS with {device} filled in.
+
+    Characters that would change the topic's structure (/, + and #) are
+    replaced, so a device id from a payload stays one topic level.
+    """
+    level = "".join("_" if c in "/+#" else c for c in device) or "unknown"
+    return MQTT_TOPIC_RESULTS.replace("{device}", level)
+
+
 def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
     try:
         payload = json.loads(msg.payload.decode())
@@ -415,14 +525,19 @@ def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> No
         log.warning("Ignored malformed message on %s: %s", msg.topic, exc)
         return
 
-    device = payload.get("device", "unknown")
+    if not isinstance(payload, dict):
+        log.warning("Ignored message on %s: expected a JSON object", msg.topic)
+        return
+
+    device = _device_from_topic(msg.topic) or payload.get("device", "unknown")
     values: list[float] = payload.get("values", [])
 
     if not isinstance(values, list) or not values:
         log.debug("Message from %s has no 'values' array — skipping", device)
         return
 
-    inference = _run_inference(values)
+    with _infer_lock:
+        inference = _run_inference(values)
 
     result = {
         "device": device,
@@ -431,7 +546,7 @@ def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> No
     }
 
     # Publish to MQTT
-    client.publish(MQTT_TOPIC_RESULTS, json.dumps(result))
+    client.publish(_results_topic(device), json.dumps(result))
 
     # Write to InfluxDB
     _write_result_to_influxdb(result)
