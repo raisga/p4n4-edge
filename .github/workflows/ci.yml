@@ -11,11 +11,14 @@ jobs:
       - name: Validate docker-compose
         run: docker compose -f docker-compose.yml config --quiet
 
+      # .env.example isn't YAML: check it by letting Compose load it instead.
       - name: Lint YAML configs
         run: |
           pip install yamllint
-          yamllint -d "{extends: relaxed, rules: {line-length: {max: 120}}}" \
-            docker-compose.yml .env.example
+          yamllint -d "{extends: relaxed, rules: {line-length: {max: 120}}}" docker-compose.yml
+
+      - name: Check .env.example loads in Compose
+        run: docker compose --env-file .env.example -f docker-compose.yml config --quiet
 
       - name: Check .env.example completeness
         run: python3 scripts/check_env_example.py
@@ -35,8 +38,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # The image's requirements, so the tests import what the runner really loads
       - name: Install test dependencies
-        run: pip install paho-mqtt pytest
+        run: pip install -r runner/requirements.txt pytest
 
       - name: Run tests
         run: pytest tests/ -v

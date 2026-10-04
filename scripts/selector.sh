@@ -31,6 +31,10 @@ declare -A SERVICE_DEPENDENTS=(
 
 ALL_SERVICES=(ei-runner)
 
+# Each service sits in a Compose profile of its own name; enabling them all
+# lets this script start and stop any service, whatever COMPOSE_PROFILES says
+COMPOSE=(docker compose --profile '*')
+
 # Get container status for a service
 get_status() {
     local service="$1"
@@ -283,7 +287,7 @@ apply_selection() {
         fi
 
         echo -e "${DIM}  Stopping: ${to_stop[*]}...${NC}"
-        if ! docker compose stop "${to_stop[@]}" 2>/dev/null; then
+        if ! "${COMPOSE[@]}" stop "${to_stop[@]}" 2>/dev/null; then
             echo -e "${RED}  ERROR: Failed to stop services.${NC}"
             exit 1
         fi
@@ -300,7 +304,7 @@ apply_selection() {
 
     if [ ${#to_start[@]} -gt 0 ]; then
         echo -e "${GREEN}  Starting: ${BOLD}${to_start[*]}${NC}"
-        if ! docker compose up -d "${to_start[@]}"; then
+        if ! "${COMPOSE[@]}" up -d "${to_start[@]}"; then
             echo -e "${RED}  ERROR: Failed to start services.${NC}"
             exit 1
         fi
@@ -316,7 +320,7 @@ apply_selection() {
 # Stop all services
 stop_all() {
     echo -e "${YELLOW}  Stopping all services...${NC}"
-    docker compose down
+    "${COMPOSE[@]}" down
     echo -e "${GREEN}  All services stopped.${NC}"
 }
 

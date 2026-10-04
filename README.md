@@ -16,6 +16,7 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
 - [Stack Components](#stack-components)
 - [Prerequisites](#prerequisites)
 - [Getting Started](#getting-started)
+- [Choosing Services](#choosing-services)
 - [Project Structure](#project-structure)
 - [Model Backends](#model-backends)
 - [Edge Impulse Models](#edge-impulse-models)
@@ -120,6 +121,12 @@ Part of the [p4n4](https://github.com/raisga/p4n4) platform — an EdgeAI + GenA
    # or check the health endpoint
    curl http://localhost:8080/health
    ```
+
+---
+
+## Choosing Services
+
+Like the other p4n4 stacks, each service sits in a [Compose profile](https://docs.docker.com/compose/how-tos/profiles/) of its own name, and `COMPOSE_PROFILES` in `.env` lists the ones that start. The default, `COMPOSE_PROFILES=ei-runner`, runs the inference runner; set it empty to keep the stack's files in a project without running anything. If `.env` has no `COMPOSE_PROFILES` line, plain `docker compose up` starts nothing; the `make` targets fall back to `ei-runner`.
 
 ---
 
@@ -338,6 +345,7 @@ curl http://localhost:8080/health
   "model_file": "/models/model.eim",
   "inference_count": 142,
   "last_inference_at": "2026-03-11T12:00:00+00:00",
+  "last_latency_ms": 11.84,
   "mqtt_connected": true,
   "influxdb_ok": true,
   "started_at": "2026-03-11T11:55:00+00:00"
@@ -354,7 +362,9 @@ curl -X POST http://localhost:8080/api/v1/infer \
   -d '{"values": [1.2, 4.5, 7.8], "device": "bench"}'
 ```
 
-The response has the same fields as a result on `inference/<device-id>/result`. `device` is optional and defaults to `api`. An invalid body returns 400 with an `error` field.
+The response has the same fields as a result on `inference/<device-id>/result`. `device` is optional and defaults to `api`. An invalid body returns 400 with an `error` field. When the loaded model (Edge Impulse or ONNX) fails on the sample, for example because it has the wrong number of values, the answer is 422 with the model's error, not a simulated result: the MQTT pipeline falls back to mock results to keep running, but a test request should see the failure.
+
+`last_latency_ms` in `/health` is the latency of the last pipeline (MQTT) inference; p4n4-api reports it as `inference_ms` in its edge metrics.
 
 `GET /api/v1/info` returns the active backend, the model file, details read from the model (the project and labels for Edge Impulse, the input name and shape for ONNX), the configured `ONNX_LABELS` and the MQTT topics.
 

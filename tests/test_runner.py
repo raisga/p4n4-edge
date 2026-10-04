@@ -50,6 +50,7 @@ def _reset_globals():
             "mode": "mock",
             "inference_count": 0,
             "last_inference_at": None,
+            "last_latency_ms": None,
             "mqtt_connected": False,
             "influxdb_ok": False,
         }
@@ -133,6 +134,26 @@ class TestModelInference:
         result = R._run_inference([1.0, 2.0])
 
         assert result["mode"] == "mock"
+
+    def test_raises_instead_of_mock_when_asked(self):
+        session = MagicMock()
+        session.run.side_effect = RuntimeError("bad input shape")
+        R._onnx_session = session
+        R._onnx_input_name = "input"
+
+        with pytest.raises(R.InferenceError, match="ONNX inference failed: bad input shape"):
+            R._run_inference([1.0, 2.0], fallback_to_mock=False)
+
+    def test_eim_raises_instead_of_mock_when_asked(self):
+        R._runner = MagicMock()
+        R._runner.classify.side_effect = RuntimeError("wrong feature count")
+
+        with pytest.raises(R.InferenceError, match="Edge Impulse inference failed"):
+            R._run_inference([1.0], fallback_to_mock=False)
+
+    def test_mock_mode_never_raises(self):
+        # No model loaded: mock results are the real thing, not a fallback.
+        assert R._run_inference([1.0], fallback_to_mock=False)["mode"] == "mock"
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +325,14 @@ class TestOnMessage:
 
         assert R._state["last_inference_at"] is not None
 
+    def test_updates_last_latency_ms(self):
+        client = MagicMock()
+        assert R._state["last_latency_ms"] is None
+
+        R._on_message(client, None, _make_mqtt_message({"device": "d", "values": [1.0]}))
+
+        assert isinstance(R._state["last_latency_ms"], float)
+
     def test_ignores_malformed_json(self):
         client = MagicMock()
         msg = _make_mqtt_message(None)
@@ -389,6 +418,12 @@ class TestInfluxDBWrite:
 
         mock_api.write.assert_called_once()
 
+    def test_init_probes_with_a_valid_precision(self, monkeypatch):
+        monkeypatch.setattr(R, "INFLUXDB_TOKEN", "token")
+        monkeypatch.setattr(R, "HAS_INFLUXDB", True)
+        assert R._init_influxdb() is True
+        R._influx_write_api.write.assert_called_once()
+
     def test_silences_write_exceptions(self):
         mock_api = MagicMock()
         mock_api.write.side_effect = Exception("influxdb down")
@@ -403,6 +438,16 @@ class TestInfluxDBWrite:
 # ---------------------------------------------------------------------------
 # Health HTTP endpoint
 # ---------------------------------------------------------------------------
+
+class TestModelFileReporting:
+    def test_mock_mode_reports_no_model_file(self):
+        assert R._model_file_for("mock") is None
+        assert R._model_file_for("starting") is None
+
+    def test_loaded_backends_report_their_file(self):
+        assert R._model_file_for("onnx") == R.ONNX_MODEL_PATH
+        assert R._model_file_for("model") == R.MODEL_PATH
+
 
 class TestHealthEndpoint:
     def test_health_returns_200(self):
@@ -507,6 +552,17 @@ class TestInferEndpoint:
         for key in ("label", "confidence", "anomaly_score", "latency_ms", "timestamp"):
             assert key in body
 
+    def test_model_failure_is_422_not_a_mock_result(self):
+        session = MagicMock()
+        session.run.side_effect = RuntimeError("expected 4 features, got 1")
+        R._onnx_session = session
+        R._onnx_input_name = "input"
+
+        status, body = _post("/api/v1/infer", {"values": [1.0]})
+
+        assert status == 422
+        assert body == {"error": "ONNX inference failed: expected 4 features, got 1"}
+
     def test_does_not_publish_store_or_count(self):
         mock_api = MagicMock()
         R._influx_write_api = mock_api
@@ -538,8 +594,21 @@ class TestInferEndpoint:
         assert status == 400
 
     def test_rejects_oversized_body(self):
-        status, _ = _post("/api/v1/infer", b"x" * (R.MAX_INFER_BODY_BYTES + 1))
-        assert status == 413
+        # The handler rejects on Content-Length alone, without reading the body.
+        # Sending the body would race the server closing the socket (BrokenPipe).
+        import http.client
+        from urllib.parse import urlsplit
+
+        url = urlsplit(_serve_one_request())
+        conn = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
+        try:
+            conn.putrequest("POST", "/api/v1/infer")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", str(R.MAX_INFER_BODY_BYTES + 1))
+            conn.endheaders()
+            assert conn.getresponse().status == 413
+        finally:
+            conn.close()
 
     def test_unknown_post_path_returns_404(self):
         status, _ = _post("/api/v1/other", {"values": [1.0]})

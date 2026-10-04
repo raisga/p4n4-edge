@@ -13,7 +13,9 @@ HTTP endpoints (on HEALTH_PORT):
   GET  /health, /      Runner status
   GET  /api/v1/info    Backend and model details
   POST /api/v1/infer   Run inference on {"values": [...]} and return the result,
-                       without publishing it to MQTT or writing it to InfluxDB
+                       without publishing it to MQTT or writing it to InfluxDB.
+                       When the loaded model fails on the input (e.g. a wrong
+                       feature count), it answers 422 rather than a mock result
 
 Environment variables (see .env.example):
   MODEL_BACKEND       Backend selection: auto | eim | onnx | mock (default: auto)
@@ -113,9 +115,11 @@ log = logging.getLogger("ei-runner")
 
 _state: dict[str, Any] = {
     "mode": "starting",      # "mock" | "model" | "onnx" | "starting"
-    "model_file": MODEL_PATH,
+    "model_file": None,      # the loaded model's path; None until one loads, and in mock mode
     "inference_count": 0,
     "last_inference_at": None,
+    # Latency of the last pipeline (MQTT) inference; p4n4-api shows it as inference_ms
+    "last_latency_ms": None,
     "mqtt_connected": False,
     "influxdb_ok": False,
     "started_at": datetime.now(timezone.utc).isoformat(),
@@ -183,8 +187,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
 
-        with _infer_lock:
-            inference = _run_inference([float(v) for v in payload["values"]])
+        try:
+            with _infer_lock:
+                inference = _run_inference(
+                    [float(v) for v in payload["values"]], fallback_to_mock=False
+                )
+        except InferenceError as exc:
+            self._send_json(422, {"error": str(exc)})
+            return
         self._send_json(
             200,
             {
@@ -236,6 +246,11 @@ def _start_health_server() -> None:
 # InfluxDB helpers
 # ---------------------------------------------------------------------------
 
+def _model_file_for(mode: str) -> str | None:
+    """The model file a backend mode loaded, as /health and /api/v1/info report it."""
+    return {"onnx": ONNX_MODEL_PATH, "model": MODEL_PATH}.get(mode)
+
+
 def _init_influxdb() -> bool:
     global _influx_write_api  # noqa: PLW0603
 
@@ -252,7 +267,7 @@ def _init_influxdb() -> bool:
             record=Point("runner_start")
             .tag("mode", _state["mode"])
             .field("version", 1)
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS),
+            .time(datetime.now(timezone.utc), WritePrecision.S),
         )
         log.info("InfluxDB connected: %s / bucket=%s", INFLUXDB_URL, INFLUXDB_BUCKET)
         return True
@@ -273,7 +288,7 @@ def _write_result_to_influxdb(result: dict) -> None:
             .field("confidence", float(result.get("confidence", 0.0)))
             .field("anomaly_score", float(result.get("anomaly_score", 0.0)))
             .field("latency_ms", float(result.get("latency_ms", 0.0)))
-            .time(datetime.now(timezone.utc), WritePrecision.SECONDS)
+            .time(datetime.now(timezone.utc), WritePrecision.S)
         )
         _influx_write_api.write(bucket=INFLUXDB_BUCKET, record=point)
     except Exception as exc:
@@ -413,8 +428,17 @@ def _postprocess_onnx_output(output: Any) -> tuple[str, float]:
     return label, confidence
 
 
-def _run_inference(values: list[float]) -> dict:
-    """Run inference on the given feature vector. Returns a result dict."""
+class InferenceError(Exception):
+    """The loaded model failed on the input (only raised when not falling back to mock)."""
+
+
+def _run_inference(values: list[float], fallback_to_mock: bool = True) -> dict:
+    """Run inference on the given feature vector. Returns a result dict.
+
+    When the loaded model fails, the MQTT pipeline falls back to a mock result so it keeps
+    going; with fallback_to_mock=False (the HTTP API) the failure raises InferenceError
+    instead, since a made-up label would be mistaken for a real one.
+    """
     t0 = time.monotonic()
 
     if _onnx_session is not None:
@@ -434,6 +458,8 @@ def _run_inference(values: list[float]) -> dict:
             }
         except Exception as exc:
             log.warning("ONNX inference error: %s", exc)
+            if not fallback_to_mock:
+                raise InferenceError(f"ONNX inference failed: {exc}") from exc
 
     if _runner is not None:
         try:
@@ -456,6 +482,8 @@ def _run_inference(values: list[float]) -> dict:
             }
         except Exception as exc:
             log.warning("Inference error: %s", exc)
+            if not fallback_to_mock:
+                raise InferenceError(f"Edge Impulse inference failed: {exc}") from exc
 
     # --- Mock mode ---
     latency_ms = (time.monotonic() - t0) * 1000 + random.uniform(5, 25)
@@ -554,6 +582,7 @@ def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> No
     with _lock:
         _state["inference_count"] += 1
         _state["last_inference_at"] = result["timestamp"]
+        _state["last_latency_ms"] = inference["latency_ms"]
 
     log.info(
         "device=%-16s  label=%-12s  confidence=%.2f  anomaly=%.2f  latency=%.1fms  [%s]",
@@ -594,7 +623,7 @@ def main() -> None:
     mode = _load_backend()
     with _lock:
         _state["mode"] = mode
-        _state["model_file"] = ONNX_MODEL_PATH if mode == "onnx" else MODEL_PATH
+        _state["model_file"] = _model_file_for(mode)
 
     if mode == "mock":
         log.info("Running in MOCK mode — simulated inference results will be published")

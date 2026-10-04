@@ -6,7 +6,7 @@ influxdb_client) before any test module imports runner.py.
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,8 @@ sys.modules.setdefault("numpy", _np_stub)
 _influx_stub = ModuleType("influxdb_client")
 _influx_stub.InfluxDBClient = MagicMock()
 _influx_stub.Point = MagicMock(return_value=MagicMock())
-_influx_stub.WritePrecision = MagicMock()
+# Only the members influxdb-client really has, so a wrong one fails the tests
+_influx_stub.WritePrecision = SimpleNamespace(MS="ms", NS="ns", S="s", US="us")
 _influx_client_stub = ModuleType("influxdb_client.client")
 _influx_write_stub = ModuleType("influxdb_client.client.write_api")
 _influx_write_stub.SYNCHRONOUS = MagicMock()

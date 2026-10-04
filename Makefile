@@ -17,6 +17,16 @@ NC     := \033[0m
 # Service list
 EDGE_SERVICES := ei-runner
 
+# Each service is in a Compose profile of the same name. Started when neither
+# the environment nor .env sets COMPOSE_PROFILES:
+DEFAULT_PROFILES := ei-runner
+ifeq ($(origin COMPOSE_PROFILES)$(shell grep -s '^COMPOSE_PROFILES=' .env),undefined)
+export COMPOSE_PROFILES := $(DEFAULT_PROFILES)
+endif
+
+# down/clean also stop services started outside COMPOSE_PROFILES (make start)
+ALL_PROFILES := --profile '*'
+
 # Default target
 help:
 	@echo ""
@@ -24,7 +34,7 @@ help:
 	@echo "  ════════════════════════════════════════════"
 	@echo ""
 	@printf "  $(BOLD)Core:$(NC)\n"
-	@printf "    $(GREEN)make up$(NC)              Start all services\n"
+	@printf "    $(GREEN)make up$(NC)              Start the services in COMPOSE_PROFILES\n"
 	@printf "    $(GREEN)make down$(NC)            Stop all services\n"
 	@printf "    $(GREEN)make restart$(NC)         Restart all services\n"
 	@printf "    $(GREEN)make status$(NC)          Show service status table\n"
@@ -66,7 +76,7 @@ up:
 
 down:
 	@echo "Stopping Edge Impulse stack..."
-	docker compose down
+	docker compose $(ALL_PROFILES) down
 
 restart:
 	@echo "Restarting Edge Impulse stack..."
@@ -91,7 +101,7 @@ clean:
 	@read -p "  Type 'yes' to confirm: " confirm; \
 	if [ "$$confirm" = "yes" ]; then \
 		echo "Stopping services and removing volumes..."; \
-		docker compose down -v; \
+		docker compose $(ALL_PROFILES) down -v; \
 		echo "Cleaned up!"; \
 	else \
 		echo "Cancelled."; \
@@ -147,10 +157,10 @@ endif
 	@deps="$(deps_$(SERVICE))"; \
 	if [ -n "$$deps" ]; then \
 		printf "$(YELLOW)  Auto-starting dependencies: $(BOLD)$$deps$(NC)\n"; \
-		docker compose up -d $$deps; \
+		docker compose $(foreach d,$(deps_$(SERVICE)),--profile $(d)) up -d $$deps; \
 	fi
 	@printf "$(GREEN)  Starting $(BOLD)$(SERVICE)$(NC)$(GREEN)...$(NC)\n"
-	@docker compose up -d $(SERVICE)
+	@docker compose $(foreach d,$(deps_$(SERVICE)) $(SERVICE),--profile $(d)) up -d $(SERVICE)
 	@printf "$(GREEN)$(BOLD)  Done!$(NC)\n"
 
 stop:
