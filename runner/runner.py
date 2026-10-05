@@ -6,8 +6,10 @@ Loads an Edge Impulse .eim model or an ONNX model, subscribes to raw sensor
 data on MQTT, runs inference for each message, and publishes results back to
 MQTT and InfluxDB (ai_events bucket).
 
-When no model is found, the runner operates in mock mode and generates
-simulated inference results so the full pipeline can be tested end-to-end.
+With MODEL_BACKEND=mock, or =auto and no model file, the runner operates in
+mock mode and generates simulated inference results so the full pipeline can
+be tested end-to-end. A model that is configured or present but fails to load
+stops the runner instead: mock results are never passed off as a model's.
 
 HTTP endpoints (on HEALTH_PORT):
   GET  /health, /      Runner status
@@ -19,6 +21,7 @@ HTTP endpoints (on HEALTH_PORT):
 
 Environment variables (see .env.example):
   MODEL_BACKEND       Backend selection: auto | eim | onnx | mock (default: auto)
+  MAX_FEATURES        Most values a sample may carry (default: 65536)
   EI_MODEL_PATH       Path to the .eim model file (default: /models/model.eim)
   EI_API_KEY          Edge Impulse API key (optional, for cloud features)
   ONNX_MODEL_PATH     Path to the .onnx model file (default: /onnx-models/model.onnx)
@@ -46,6 +49,7 @@ import math
 import os
 import random
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -67,7 +71,9 @@ try:
     from edge_impulse_linux.runner import ImpulseRunner
 
     HAS_EI_SDK = True
-except ImportError:
+# The SDK's package __init__ also imports its audio and image modules, and the
+# image module calls exit(1) when OpenCV is missing
+except (ImportError, SystemExit):
     HAS_EI_SDK = False
 
 try:
@@ -99,6 +105,9 @@ INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "ming")
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "ai_events")
 HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8080"))
 MAX_INFER_BODY_BYTES = 1024 * 1024
+MAX_FEATURES = int(os.environ.get("MAX_FEATURES", "65536"))
+# Models take float32 input, so larger magnitudes can't be passed to them
+FLOAT32_MAX = 3.4028234663852886e38
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -182,16 +191,15 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "body must be JSON"})
             return
 
-        error = _validate_infer_payload(payload)
-        if error:
-            self._send_json(400, {"error": error})
+        try:
+            values = _sample_values(payload)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
             return
 
         try:
             with _infer_lock:
-                inference = _run_inference(
-                    [float(v) for v in payload["values"]], fallback_to_mock=False
-                )
+                inference = _run_inference(values)
         except InferenceError as exc:
             self._send_json(422, {"error": str(exc)})
             return
@@ -208,16 +216,32 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass  # suppress HTTP access logs
 
 
-def _validate_infer_payload(payload: Any) -> str | None:
-    """Return an error message for an invalid /api/v1/infer body, else None."""
+def _sample_values(payload: Any) -> list[float]:
+    """The feature vector of a sample ({"values": [...]}), from MQTT or /api/v1/infer.
+
+    Raises ValueError, with a message for the sender, unless payload is a JSON
+    object whose "values" is a non-empty array of at most MAX_FEATURES finite
+    numbers in float32 range.
+    """
     if not isinstance(payload, dict):
-        return "body must be a JSON object"
+        raise ValueError("body must be a JSON object")
     values = payload.get("values")
     if not isinstance(values, list) or not values:
-        return "'values' must be a non-empty array of numbers"
-    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in values):
-        return "'values' must contain only numbers"
-    return None
+        raise ValueError("'values' must be a non-empty array of numbers")
+    if len(values) > MAX_FEATURES:
+        raise ValueError(f"'values' must have at most {MAX_FEATURES} numbers")
+    floats: list[float] = []
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError("'values' must contain only numbers")
+        try:
+            f = float(v)
+        except OverflowError:  # an integer too large for a float
+            f = math.inf
+        if not abs(f) <= FLOAT32_MAX:  # also rejects NaN
+            raise ValueError("'values' must be finite numbers in float32 range")
+        floats.append(f)
+    return floats
 
 
 def _info() -> dict:
@@ -272,11 +296,22 @@ def _init_influxdb() -> bool:
         log.info("InfluxDB connected: %s / bucket=%s", INFLUXDB_URL, INFLUXDB_BUCKET)
         return True
     except Exception as exc:
-        log.warning("InfluxDB unavailable (%s) — inference results will not be persisted", exc)
+        # The write API stays set: each result tries again, so writes resume
+        # once InfluxDB is reachable
+        log.warning("InfluxDB unavailable (%s) — retrying with each result", exc)
         return False
 
 
+# Write failures are counted and logged at most once a minute: while InfluxDB
+# is down, every result fails
+WRITE_WARNING_INTERVAL_S = 60.0
+_failed_writes = 0
+_last_write_warning = -WRITE_WARNING_INTERVAL_S
+
+
 def _write_result_to_influxdb(result: dict) -> None:
+    global _failed_writes, _last_write_warning  # noqa: PLW0603
+
     if _influx_write_api is None:
         return
     try:
@@ -288,19 +323,40 @@ def _write_result_to_influxdb(result: dict) -> None:
             .field("confidence", float(result.get("confidence", 0.0)))
             .field("anomaly_score", float(result.get("anomaly_score", 0.0)))
             .field("latency_ms", float(result.get("latency_ms", 0.0)))
-            .time(datetime.now(timezone.utc), WritePrecision.S)
+            # Milliseconds: at second precision, a second result for the same
+            # device and label within a second overwrote the first
+            .time(datetime.now(timezone.utc), WritePrecision.MS)
         )
         _influx_write_api.write(bucket=INFLUXDB_BUCKET, record=point)
     except Exception as exc:
-        log.debug("InfluxDB write failed: %s", exc)
+        with _lock:
+            _state["influxdb_ok"] = False
+        _failed_writes += 1
+        now = time.monotonic()
+        if now - _last_write_warning >= WRITE_WARNING_INTERVAL_S:
+            log.warning(
+                "InfluxDB write failed (%d result(s) not stored since the last warning): %s",
+                _failed_writes,
+                exc,
+            )
+            _failed_writes = 0
+            _last_write_warning = now
+    else:
+        with _lock:
+            _state["influxdb_ok"] = True
 
 
 # ---------------------------------------------------------------------------
 # Edge Impulse model inference
 # ---------------------------------------------------------------------------
 
+class BackendError(Exception):
+    """The configured model backend can't run; the runner stops rather than mock."""
+
+
 def _load_model() -> bool:
-    """Try to load the .eim model. Returns True on success."""
+    """Load the .eim model. False when there's no model file; raises
+    BackendError when there is one but it doesn't load."""
     global _runner  # noqa: PLW0603
 
     model_file = Path(MODEL_PATH)
@@ -313,11 +369,10 @@ def _load_model() -> bool:
         return False
 
     if not HAS_EI_SDK:
-        log.warning(
-            "edge_impulse_linux SDK not available — cannot load .eim model. "
+        raise BackendError(
+            "edge_impulse_linux SDK not available — cannot load the .eim model. "
             "This is unexpected inside the container; check the image build."
         )
-        return False
 
     try:
         log.info("Loading Edge Impulse model: %s", MODEL_PATH)
@@ -342,9 +397,8 @@ def _load_model() -> bool:
         )
         return True
     except Exception as exc:
-        log.error("Failed to load model: %s — falling back to MOCK mode", exc)
         _runner = None
-        return False
+        raise BackendError(f"Failed to load Edge Impulse model {MODEL_PATH}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +406,8 @@ def _load_model() -> bool:
 # ---------------------------------------------------------------------------
 
 def _load_onnx_model() -> bool:
-    """Try to load the .onnx model. Returns True on success."""
+    """Load the .onnx model. False when there's no model file; raises
+    BackendError when there is one but it doesn't load."""
     global _onnx_session, _onnx_input_name  # noqa: PLW0603
 
     model_file = Path(ONNX_MODEL_PATH)
@@ -365,11 +420,10 @@ def _load_onnx_model() -> bool:
         return False
 
     if not HAS_ONNX:
-        log.warning(
-            "onnxruntime not available — cannot load ONNX model. "
+        raise BackendError(
+            "onnxruntime not available — cannot load the ONNX model. "
             "This is unexpected inside the container; check the image build."
         )
-        return False
 
     try:
         log.info("Loading ONNX model: %s", ONNX_MODEL_PATH)
@@ -382,10 +436,9 @@ def _load_onnx_model() -> bool:
         _onnx_input_name = inp.name
         return True
     except Exception as exc:
-        log.error("Failed to load ONNX model: %s", exc)
         _onnx_session = None
         _onnx_input_name = None
-        return False
+        raise BackendError(f"Failed to load ONNX model {ONNX_MODEL_PATH}: {exc}") from exc
 
 
 def _flatten_scores(output: Any) -> list[float]:
@@ -429,15 +482,15 @@ def _postprocess_onnx_output(output: Any) -> tuple[str, float]:
 
 
 class InferenceError(Exception):
-    """The loaded model failed on the input (only raised when not falling back to mock)."""
+    """The loaded model failed on the input."""
 
 
-def _run_inference(values: list[float], fallback_to_mock: bool = True) -> dict:
+def _run_inference(values: list[float]) -> dict:
     """Run inference on the given feature vector. Returns a result dict.
 
-    When the loaded model fails, the MQTT pipeline falls back to a mock result so it keeps
-    going; with fallback_to_mock=False (the HTTP API) the failure raises InferenceError
-    instead, since a made-up label would be mistaken for a real one.
+    Mock results come only from mock mode, when no model is loaded. When the
+    loaded model fails on the input, this raises InferenceError: a made-up
+    label in its place would be mistaken for a real one.
     """
     t0 = time.monotonic()
 
@@ -457,9 +510,7 @@ def _run_inference(values: list[float], fallback_to_mock: bool = True) -> dict:
                 "mode": "onnx",
             }
         except Exception as exc:
-            log.warning("ONNX inference error: %s", exc)
-            if not fallback_to_mock:
-                raise InferenceError(f"ONNX inference failed: {exc}") from exc
+            raise InferenceError(f"ONNX inference failed: {exc}") from exc
 
     if _runner is not None:
         try:
@@ -481,9 +532,7 @@ def _run_inference(values: list[float], fallback_to_mock: bool = True) -> dict:
                 "mode": "model",
             }
         except Exception as exc:
-            log.warning("Inference error: %s", exc)
-            if not fallback_to_mock:
-                raise InferenceError(f"Edge Impulse inference failed: {exc}") from exc
+            raise InferenceError(f"Edge Impulse inference failed: {exc}") from exc
 
     # --- Mock mode ---
     latency_ms = (time.monotonic() - t0) * 1000 + random.uniform(5, 25)
@@ -511,21 +560,36 @@ def _run_inference(values: list[float], fallback_to_mock: bool = True) -> dict:
 # MQTT callbacks
 # ---------------------------------------------------------------------------
 
-def _on_connect(client: mqtt.Client, userdata: Any, flags: dict, rc: int, props=None) -> None:
-    if rc == 0:
-        with _lock:
-            _state["mqtt_connected"] = True
-        log.info("MQTT connected to %s:%d", MQTT_HOST, MQTT_PORT)
-        client.subscribe(MQTT_TOPIC_INPUT)
-        log.info("Subscribed to topic: %s", MQTT_TOPIC_INPUT)
-    else:
-        log.error("MQTT connection failed (rc=%d)", rc)
+# paho's VERSION2 callback API (see main()). Reason codes are ReasonCode
+# objects, not ints: format them with %s.
+
+def _on_connect(
+    client: mqtt.Client,
+    userdata: Any,
+    flags: mqtt.ConnectFlags,
+    reason_code: mqtt.ReasonCode,
+    properties: mqtt.Properties | None = None,
+) -> None:
+    if reason_code.is_failure:
+        log.error("MQTT connection refused: %s", reason_code)
+        return
+    with _lock:
+        _state["mqtt_connected"] = True
+    log.info("MQTT connected to %s:%d", MQTT_HOST, MQTT_PORT)
+    client.subscribe(MQTT_TOPIC_INPUT)
+    log.info("Subscribed to topic: %s", MQTT_TOPIC_INPUT)
 
 
-def _on_disconnect(client: mqtt.Client, userdata: Any, rc: int, props=None) -> None:
+def _on_disconnect(
+    client: mqtt.Client,
+    userdata: Any,
+    flags: mqtt.DisconnectFlags,
+    reason_code: mqtt.ReasonCode,
+    properties: mqtt.Properties | None = None,
+) -> None:
     with _lock:
         _state["mqtt_connected"] = False
-    log.warning("MQTT disconnected (rc=%d) — will reconnect", rc)
+    log.warning("MQTT disconnected (%s) — will reconnect", reason_code)
 
 
 def _device_from_topic(topic: str) -> str | None:
@@ -547,6 +611,16 @@ def _results_topic(device: str) -> str:
 
 
 def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
+    # paho doesn't catch exceptions from callbacks: one escaping here would end
+    # loop_forever() and the runner, and a retained message would end it again
+    # on every restart
+    try:
+        _handle_message(client, msg)
+    except Exception:
+        log.exception("Dropped message on %s", msg.topic)
+
+
+def _handle_message(client: mqtt.Client, msg: mqtt.MQTTMessage) -> None:
     try:
         payload = json.loads(msg.payload.decode())
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -557,15 +631,23 @@ def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> No
         log.warning("Ignored message on %s: expected a JSON object", msg.topic)
         return
 
-    device = _device_from_topic(msg.topic) or payload.get("device", "unknown")
-    values: list[float] = payload.get("values", [])
+    device = _device_from_topic(msg.topic) or str(payload.get("device", "unknown"))
 
-    if not isinstance(values, list) or not values:
+    if "values" not in payload:
         log.debug("Message from %s has no 'values' array — skipping", device)
         return
+    try:
+        values = _sample_values(payload)
+    except ValueError as exc:
+        log.warning("Ignored sample on %s: %s", msg.topic, exc)
+        return
 
-    with _infer_lock:
-        inference = _run_inference(values)
+    try:
+        with _infer_lock:
+            inference = _run_inference(values)
+    except InferenceError as exc:
+        log.warning("Dropped sample on %s: %s", msg.topic, exc)
+        return
 
     result = {
         "device": device,
@@ -602,14 +684,25 @@ def _on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> No
 def _load_backend() -> str:
     """Load the configured model backend. Returns the resulting mode.
 
-    MODEL_BACKEND=auto tries Edge Impulse first, then ONNX; "eim" and
-    "onnx" force a single backend; anything else (e.g. "mock") skips
-    model loading entirely. Falls back to mock mode when loading fails.
+    MODEL_BACKEND=auto tries Edge Impulse first, then ONNX, and runs in mock
+    mode only when neither model file exists; "eim" and "onnx" force a single
+    backend; "mock" skips model loading. Raises BackendError when the
+    configured backend has no model, a model file fails to load, or
+    MODEL_BACKEND is unknown.
     """
+    if MODEL_BACKEND == "mock":
+        return "mock"
+    if MODEL_BACKEND not in ("auto", "eim", "onnx"):
+        raise BackendError(f"Unknown MODEL_BACKEND {MODEL_BACKEND!r}: use auto, eim, onnx or mock.")
     if MODEL_BACKEND in ("auto", "eim") and _load_model():
         return "model"
     if MODEL_BACKEND in ("auto", "onnx") and _load_onnx_model():
         return "onnx"
+    if MODEL_BACKEND != "auto":
+        raise BackendError(
+            f"MODEL_BACKEND={MODEL_BACKEND} but there's no model file; "
+            "add one, or set MODEL_BACKEND=auto or mock."
+        )
     return "mock"
 
 
@@ -620,7 +713,11 @@ def main() -> None:
     threading.Thread(target=_start_health_server, daemon=True).start()
 
     # Load model
-    mode = _load_backend()
+    try:
+        mode = _load_backend()
+    except BackendError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
     with _lock:
         _state["mode"] = mode
         _state["model_file"] = _model_file_for(mode)

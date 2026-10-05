@@ -14,7 +14,10 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import paho.mqtt.client as mqtt
 import pytest
+from paho.mqtt.packettypes import PacketTypes
+from paho.mqtt.reasoncodes import ReasonCode
 
 # Make sure the runner package is importable from this repo layout
 _RUNNER_DIR = Path(__file__).parent.parent / "runner"
@@ -126,34 +129,16 @@ class TestModelInference:
         assert result["confidence"] == pytest.approx(0.9, abs=1e-4)
         assert result["anomaly_score"] == pytest.approx(0.87, abs=1e-4)
 
-    def test_falls_back_to_mock_on_runner_exception(self):
-        mock_runner = MagicMock()
-        mock_runner.classify.side_effect = RuntimeError("model crashed")
-        R._runner = mock_runner
-
-        result = R._run_inference([1.0, 2.0])
-
-        assert result["mode"] == "mock"
-
-    def test_raises_instead_of_mock_when_asked(self):
-        session = MagicMock()
-        session.run.side_effect = RuntimeError("bad input shape")
-        R._onnx_session = session
-        R._onnx_input_name = "input"
-
-        with pytest.raises(R.InferenceError, match="ONNX inference failed: bad input shape"):
-            R._run_inference([1.0, 2.0], fallback_to_mock=False)
-
-    def test_eim_raises_instead_of_mock_when_asked(self):
+    def test_eim_failure_raises_instead_of_mocking(self):
         R._runner = MagicMock()
         R._runner.classify.side_effect = RuntimeError("wrong feature count")
 
         with pytest.raises(R.InferenceError, match="Edge Impulse inference failed"):
-            R._run_inference([1.0], fallback_to_mock=False)
+            R._run_inference([1.0])
 
     def test_mock_mode_never_raises(self):
         # No model loaded: mock results are the real thing, not a fallback.
-        assert R._run_inference([1.0], fallback_to_mock=False)["mode"] == "mock"
+        assert R._run_inference([1.0])["mode"] == "mock"
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +190,14 @@ class TestOnnxInference:
 
         assert result["label"] == "class_1"
 
-    def test_falls_back_to_mock_on_session_exception(self):
+    def test_session_failure_raises_instead_of_mocking(self):
         session = MagicMock()
         session.run.side_effect = RuntimeError("bad input shape")
         R._onnx_session = session
         R._onnx_input_name = "input"
 
-        result = R._run_inference([1.0, 2.0])
-
-        assert result["mode"] == "mock"
+        with pytest.raises(R.InferenceError, match="ONNX inference failed: bad input shape"):
+            R._run_inference([1.0, 2.0])
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +239,40 @@ class TestLoadBackend:
             assert R._load_backend() == "mock"
         load_eim.assert_not_called()
         load_onnx.assert_not_called()
+
+    @pytest.mark.parametrize("backend", ["eim", "onnx"])
+    def test_forced_backend_without_model_raises(self, backend):
+        with patch.object(R, "MODEL_BACKEND", backend), \
+             patch.object(R, "_load_model", return_value=False), \
+             patch.object(R, "_load_onnx_model", return_value=False), \
+             pytest.raises(R.BackendError, match="no model file"):
+            R._load_backend()
+
+    def test_unknown_backend_raises(self):
+        with patch.object(R, "MODEL_BACKEND", "onxx"), \
+             pytest.raises(R.BackendError, match="Unknown MODEL_BACKEND"):
+            R._load_backend()
+
+    def test_present_model_that_fails_to_load_raises(self, tmp_path):
+        model = tmp_path / "model.onnx"
+        model.write_bytes(b"not a model")
+        R.ort.InferenceSession.side_effect = RuntimeError("invalid protobuf")
+        try:
+            with patch.object(R, "MODEL_BACKEND", "auto"), \
+                 patch.object(R, "_load_model", return_value=False), \
+                 patch.object(R, "ONNX_MODEL_PATH", str(model)), \
+                 pytest.raises(R.BackendError, match="invalid protobuf"):
+                R._load_backend()
+        finally:
+            R.ort.InferenceSession.side_effect = None
+
+    def test_present_eim_without_sdk_raises(self, tmp_path):
+        model = tmp_path / "model.eim"
+        model.write_bytes(b"")
+        with patch.object(R, "MODEL_PATH", str(model)), \
+             patch.object(R, "HAS_EI_SDK", False), \
+             pytest.raises(R.BackendError, match="SDK not available"):
+            R._load_model()
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +414,97 @@ class TestOnMessage:
         assert data["device"] == "unknown"
 
 
+class TestMqttRobustness:
+    """Nothing may escape a paho callback: paho re-raises it out of
+    loop_forever() and the runner exits (a retained message, on every restart)."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"[1,2,3]",
+            b'"hello"',
+            b"42",
+            b"null",
+            b'{"values": ["a"]}',
+            b'{"values": [true, 1.0]}',
+            b'{"values": [1e200]}',
+            b'{"values": [1e400]}',
+            b'{"values": [NaN]}',
+            b'{"values": [' + b"9" * 400 + b"]}",
+            b"[" * 1000 + b"]" * 1000,
+        ],
+    )
+    def test_bad_payload_is_dropped_not_raised(self, payload):
+        client = MagicMock()
+
+        R._on_message(client, None, _make_mqtt_message(payload))
+
+        client.publish.assert_not_called()
+        assert R._state["inference_count"] == 0
+
+    def test_rejects_more_than_max_features(self, monkeypatch):
+        monkeypatch.setattr(R, "MAX_FEATURES", 2)
+        client = MagicMock()
+
+        R._on_message(client, None, _make_mqtt_message({"values": [1.0, 2.0, 3.0]}))
+
+        client.publish.assert_not_called()
+
+    def test_model_failure_drops_the_sample_instead_of_mocking(self):
+        session = MagicMock()
+        session.run.side_effect = RuntimeError("expected 4 features, got 1")
+        R._onnx_session = session
+        R._onnx_input_name = "input"
+        client = MagicMock()
+
+        R._on_message(client, None, _make_mqtt_message({"values": [1.0]}))
+
+        client.publish.assert_not_called()
+        assert R._state["inference_count"] == 0
+
+    def test_disconnect_takes_version2_arguments(self):
+        R._state["mqtt_connected"] = True
+
+        R._on_disconnect(
+            MagicMock(),
+            None,
+            mqtt.DisconnectFlags(is_disconnect_packet_from_server=False),
+            ReasonCode(PacketTypes.DISCONNECT, "Unspecified error"),
+            None,
+        )
+
+        assert R._state["mqtt_connected"] is False
+
+    def test_refused_connection_is_logged_and_not_subscribed(self, caplog):
+        client = MagicMock()
+
+        R._on_connect(
+            client,
+            None,
+            mqtt.ConnectFlags(session_present=False),
+            ReasonCode(PacketTypes.CONNACK, "Not authorized"),
+            None,
+        )
+
+        client.subscribe.assert_not_called()
+        assert "MQTT connection refused: Not authorized" in caplog.text
+        assert R._state["mqtt_connected"] is False
+
+    def test_accepted_connection_subscribes(self):
+        client = MagicMock()
+
+        R._on_connect(
+            client,
+            None,
+            mqtt.ConnectFlags(session_present=False),
+            ReasonCode(PacketTypes.CONNACK, "Success"),
+            None,
+        )
+
+        client.subscribe.assert_called_once_with(R.MQTT_TOPIC_INPUT)
+        assert R._state["mqtt_connected"] is True
+
+
 # ---------------------------------------------------------------------------
 # _write_result_to_influxdb — InfluxDB write
 # ---------------------------------------------------------------------------
@@ -433,6 +542,19 @@ class TestInfluxDBWrite:
         R._write_result_to_influxdb(
             {"device": "d", "label": "idle", "confidence": 0.9, "anomaly_score": 0.1, "latency_ms": 10.0, "mode": "mock"}
         )
+
+    def test_health_follows_the_last_write(self):
+        mock_api = MagicMock()
+        R._influx_write_api = mock_api
+        result = {"device": "d", "label": "idle", "confidence": 0.9, "mode": "mock"}
+
+        mock_api.write.side_effect = Exception("influxdb down")
+        R._write_result_to_influxdb(result)
+        assert R._state["influxdb_ok"] is False
+
+        mock_api.write.side_effect = None
+        R._write_result_to_influxdb(result)
+        assert R._state["influxdb_ok"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +704,8 @@ class TestInferEndpoint:
             {"values": "1,2,3"},
             {"values": [1, "2"]},
             {"values": [True, 1.0]},
+            {"values": [1e200]},
+            {"values": [float("nan")]},
         ],
     )
     def test_rejects_invalid_body(self, body):

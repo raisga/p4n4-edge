@@ -38,9 +38,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # The image's requirements, so the tests import what the runner really loads
+      # The image's requirements, so the tests import what the runner really loads.
+      # PyAudio (for the Edge Impulse SDK) compiles against PortAudio's headers.
       - name: Install test dependencies
-        run: pip install -r runner/requirements.txt pytest
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends portaudio19-dev
+          pip install -r runner/requirements.txt pytest
 
       - name: Run tests
         run: pytest tests/ -v

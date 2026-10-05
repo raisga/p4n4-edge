@@ -163,9 +163,11 @@ The runner supports two inference backends, selected via `MODEL_BACKEND` in `.en
 | Value | Behavior |
 |-------|----------|
 | `auto` *(default)* | Load the Edge Impulse `.eim` if present, else the ONNX `.onnx`, else mock mode |
-| `eim` | Edge Impulse only — mock mode if no `.eim` is found |
-| `onnx` | ONNX Runtime only — mock mode if no `.onnx` is found |
+| `eim` | Edge Impulse only — the runner stops if no `.eim` is found |
+| `onnx` | ONNX Runtime only — the runner stops if no `.onnx` is found |
 | `mock` | Simulated inference, no model loaded |
+
+A model file that is present but fails to load also stops the runner, and so does an unknown `MODEL_BACKEND`: the reason is in `docker logs p4n4-ei-runner`, and `restart: unless-stopped` keeps retrying. The runner never falls back to simulated results for a model it was meant to run.
 
 Only one backend is active at a time. The active backend is reported in the `mode` field of the health endpoint and every result payload (`model` = Edge Impulse, `onnx` = ONNX Runtime, `mock` = simulated).
 
@@ -296,7 +298,7 @@ Results are also written to the `ai_events` InfluxDB bucket with the measurement
 
 ## Mock Mode
 
-When no model file is found (or the selected backend cannot be loaded), the runner enters **mock mode** automatically:
+With `MODEL_BACKEND=mock`, or with `auto` when no model file is found, the runner runs in **mock mode**:
 
 - Simulated inference results are generated based on input magnitude
 - Labels are sampled from `["idle", "running", "anomaly", "vibration"]`
@@ -362,7 +364,9 @@ curl -X POST http://localhost:8080/api/v1/infer \
   -d '{"values": [1.2, 4.5, 7.8], "device": "bench"}'
 ```
 
-The response has the same fields as a result on `inference/<device-id>/result`. `device` is optional and defaults to `api`. An invalid body returns 400 with an `error` field. When the loaded model (Edge Impulse or ONNX) fails on the sample, for example because it has the wrong number of values, the answer is 422 with the model's error, not a simulated result: the MQTT pipeline falls back to mock results to keep running, but a test request should see the failure.
+The response has the same fields as a result on `inference/<device-id>/result`. `device` is optional and defaults to `api`. An invalid body returns 400 with an `error` field. When the loaded model (Edge Impulse or ONNX) fails on the sample, for example because it has the wrong number of values, the answer is 422 with the model's error, not a simulated result. On MQTT, such a sample is dropped with a warning in the log.
+
+Samples, over HTTP or MQTT, must carry a non-empty `values` array of at most `MAX_FEATURES` (default 65536) finite numbers within float32 range. On MQTT, any other message on the input topic is logged and dropped.
 
 `last_latency_ms` in `/health` is the latency of the last pipeline (MQTT) inference; p4n4-api reports it as `inference_ms` in its edge metrics.
 
@@ -391,7 +395,7 @@ docker run --rm --network p4n4-net eclipse-mosquitto:2 \
 
 | Service | Port | URL |
 |---------|------|-----|
-| ei-runner health API | `8080` | <http://localhost:8080/health> |
+| ei-runner health API | `8080` (on `127.0.0.1`; `EI_RUNNER_BIND` in `.env`) | <http://localhost:8080/health> |
 
 ---
 
@@ -439,7 +443,7 @@ p4n4 up --edge   # start Edge stack
 
 4. **EI_API_KEY** — only required for Edge Impulse cloud features (e.g., continuous learning). Leave blank for fully offline deployments.
 
-5. **Restrict port exposure** — for production, remove the `8080` host-port binding and access the health and inference endpoints only within `p4n4-net`.
+5. **Restrict port exposure** — the `8080` API has no authentication, so it's published on `127.0.0.1` only. Set `EI_RUNNER_BIND` in `.env` to publish it on another address, on a trusted network only.
 
 ---
 

@@ -17,10 +17,14 @@ services:
     profiles: [ei-runner]
     restart: unless-stopped
     ports:
-      - "8080:8080"   # Health / status API
+      # Health / status and inference API. Localhost only by default: it has no
+      # authentication. p4n4-api reaches it on p4n4-net or on localhost.
+      - "${EI_RUNNER_BIND:-127.0.0.1}:8080:8080"
     environment:
       # Model backend: auto | eim | onnx | mock
       MODEL_BACKEND: ${MODEL_BACKEND:-auto}
+      # Most values one sample may carry; larger samples are rejected
+      MAX_FEATURES: ${MAX_FEATURES:-65536}
       # Edge Impulse model file (place .eim in edge-impulse/models/)
       EI_MODEL_PATH: /models/${EI_MODEL_FILE:-model.eim}
       EI_API_KEY: ${EI_API_KEY:-}

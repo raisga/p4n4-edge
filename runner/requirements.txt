@@ -1,5 +1,11 @@
-edge_impulse_linux>=1.0
+# edge_impulse_linux's source release ships without the file that lists its
+# dependencies, so pip installs it with none: they're listed here instead
+# (PyAudio and OpenCV are imported by the package's __init__).
+edge_impulse_linux==1.2.2
+PyAudio>=0.2.11,<0.3
+opencv-python-headless>=4.5.1.48,<5
+six>=1.16,<2
 onnxruntime>=1.17
-numpy>=1.26
+numpy>=1.26,<3
 paho-mqtt>=2.0
 influxdb-client>=1.40
