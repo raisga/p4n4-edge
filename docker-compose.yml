@@ -15,7 +15,7 @@ services:
     build: ./runner
     container_name: p4n4-ei-runner
     profiles: [ei-runner]
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     ports:
       # Health / status and inference API. Localhost only by default: it has no
       # authentication. p4n4-api reaches it on p4n4-net or on localhost.
